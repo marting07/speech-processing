@@ -546,6 +546,10 @@ class SpeechRecognitionApp(QMainWindow):
         self.save_btn = QPushButton("Save Segment")
         self.save_btn.clicked.connect(self.save_segment)
         controls_layout.addWidget(self.save_btn)
+        # Play button
+        self.play_btn = QPushButton("Play")
+        self.play_btn.clicked.connect(self.play_audio)
+        controls_layout.addWidget(self.play_btn)
         # Compare button
         self.compare_btn = QPushButton("Compare")
         self.compare_btn.clicked.connect(self.compare_audio)
@@ -572,6 +576,61 @@ class SpeechRecognitionApp(QMainWindow):
             self.plot_waveform()
         except Exception as e:
             QMessageBox.critical(self, "Recording Error", str(e))
+
+    def play_audio(self):
+        """Play back the recorded audio or a selected segment.
+
+        If a segmentation has been performed, the user is offered the option to
+        play the entire recording or one of the detected segments.  Playback
+        uses the sounddevice library's ``play`` function, which accepts a
+        NumPy array and a sampling rate and plays back the signal on the
+        default output device【574514951566577†L41-L60】.  Any currently
+        running playback is stopped before starting a new one.
+        """
+        if sd is None:
+            QMessageBox.critical(self, "Missing Dependency", "sounddevice is not installed.")
+            return
+        if self.audio_data.size == 0:
+            QMessageBox.warning(self, "No audio", "Please record audio before playing.")
+            return
+        # Determine which portion to play
+        data_to_play: np.ndarray
+        # If segments exist, allow the user to choose
+        if self.segments:
+            # build list with "Whole recording" option and each segment labeled
+            items = ["Whole recording"] + [
+                f"Segment {i+1}: {start/self.fs:.2f}s–{end/self.fs:.2f}s"
+                for i, (start, end) in enumerate(self.segments)
+            ]
+            selection, ok = QInputDialog.getItem(
+                self,
+                "Play Audio",
+                "Select what to play:",
+                items,
+                0,
+                False,
+            )
+            if not ok:
+                return
+            if selection and selection != "Whole recording":
+                seg_idx = items.index(selection) - 1
+                start, end = self.segments[seg_idx]
+                data_to_play = self.audio_data[start:end]
+            else:
+                data_to_play = self.audio_data
+        else:
+            data_to_play = self.audio_data
+        # play the selected audio
+        try:
+            # stop any existing playback before starting a new one
+            try:
+                sd.stop()
+            except Exception:
+                pass
+            # use blocking playback so the user cannot start another play until finished
+            sd.play(data_to_play, samplerate=self.fs, blocking=False)
+        except Exception as e:
+            QMessageBox.critical(self, "Playback Error", str(e))
 
     def plot_waveform(self):
         """Plot the current audio waveform and segmentation marks."""
