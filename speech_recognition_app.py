@@ -303,11 +303,7 @@ class SpeechRecognitionApp(QMainWindow):
         QMessageBox.information(self, "Saved", f"Segment saved under label '{label}'.")
 
     def compare_audio(self):
-        """Record a new sample and compare against dictionary entries using DTW."""
-        if not is_available():
-            QMessageBox.critical(self, "Missing Dependency", "sounddevice is not installed.")
-            return
-
+        """Compare a selected segmented utterance against dictionary entries."""
         dictionary = load_dictionary(self.dictionary_file)
         if not dictionary:
             QMessageBox.warning(
@@ -317,17 +313,33 @@ class SpeechRecognitionApp(QMainWindow):
             )
             return
 
-        self.status_label.setText("Recording sample for comparison...")
-        self.repaint()
-        try:
-            new_samples = record_audio(self.fs, self.record_duration)
-        except AudioIOError as exc:
-            QMessageBox.critical(self, "Recording Error", str(exc))
+        if self.audio_data.size == 0:
+            QMessageBox.warning(self, "No audio", "Please record audio before comparing.")
             return
+        if not self.segments:
+            QMessageBox.warning(self, "No segments", "Please segment audio before comparing.")
+            return
+
+        segment_items = [
+            f"Segment {i+1}: {start/self.fs:.2f}s–{end/self.fs:.2f}s"
+            for i, (start, end) in enumerate(self.segments)
+        ]
+        segment_index, ok = QInputDialog.getItem(
+            self, "Select Segment", "Choose a segment to compare:", segment_items, 0, False
+        )
+        if not ok:
+            return
+        selected_idx = segment_items.index(segment_index)
+        start, end = self.segments[selected_idx]
+        segment_samples = self.audio_data[start:end]
+
+        self.status_label.setText("Comparing selected segment...")
+        self.repaint()
+
         feature_type = self.feature_combo.currentText()
         if feature_type == "mfcc":
             query_features = compute_mfcc(
-                new_samples,
+                segment_samples,
                 self.fs,
                 num_filters=DEFAULT_MEL_FILTERS,
                 num_ceps=DEFAULT_MEL_FILTERS,
@@ -338,7 +350,7 @@ class SpeechRecognitionApp(QMainWindow):
             )
         else:
             query_features = compute_bark_band_energies(
-                new_samples,
+                segment_samples,
                 self.fs,
                 frame_ms=DEFAULT_FRAME_MS,
                 hop_ms=DEFAULT_HOP_MS,

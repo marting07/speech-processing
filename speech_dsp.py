@@ -94,8 +94,9 @@ def _adaptive_threshold(feature: np.ndarray, ratio: float) -> float:
 def _smooth_mask(raw_mask: np.ndarray, hop_ms: float) -> np.ndarray:
     """Fill short gaps and suppress very short speech islands."""
     mask = raw_mask.astype(bool).copy()
-    max_gap_frames = max(1, int(round(20.0 / hop_ms)))   # ~20 ms
-    min_run_frames = max(1, int(round(50.0 / hop_ms)))   # ~50 ms
+    # Allow short unvoiced/closure intervals inside a single word.
+    max_gap_frames = max(1, int(round(120.0 / hop_ms)))  # ~120 ms
+    min_run_frames = max(1, int(round(40.0 / hop_ms)))   # ~40 ms
 
     idx = 0
     while idx < len(mask):
@@ -151,6 +152,36 @@ def _mask_to_segments(
     return segments
 
 
+def _postprocess_segments(
+    segments: List[Tuple[int, int]],
+    fs: int,
+    merge_gap_ms: float = 150.0,
+    min_segment_ms: float = 120.0,
+) -> List[Tuple[int, int]]:
+    """Merge close segments and remove very short artifacts."""
+    if not segments:
+        return []
+
+    merge_gap = int(fs * merge_gap_ms / 1000.0)
+    min_segment = int(fs * min_segment_ms / 1000.0)
+
+    merged: List[Tuple[int, int]] = []
+    cur_start, cur_end = segments[0]
+    for start, end in segments[1:]:
+        if start - cur_end <= merge_gap:
+            cur_end = end
+        else:
+            merged.append((cur_start, cur_end))
+            cur_start, cur_end = start, end
+    merged.append((cur_start, cur_end))
+
+    filtered = [(s, e) for s, e in merged if (e - s) >= min_segment]
+    if filtered:
+        return filtered
+    # If all got filtered out, keep the longest merged segment.
+    return [max(merged, key=lambda se: se[1] - se[0])]
+
+
 def detect_segments_energy(
     signal_samples: np.ndarray,
     fs: int,
@@ -166,7 +197,8 @@ def detect_segments_energy(
     energy = compute_short_time_energy(signal_samples, frame_size, hop_size)
     threshold = _adaptive_threshold(energy, energy_threshold_ratio)
     mask = _smooth_mask(energy > threshold, hop_ms)
-    return _mask_to_segments(mask, hop_size, frame_size, len(signal_samples))
+    segments = _mask_to_segments(mask, hop_size, frame_size, len(signal_samples))
+    return _postprocess_segments(segments, fs)
 
 
 def detect_segments_zcr(
@@ -184,7 +216,8 @@ def detect_segments_zcr(
     zcr = compute_zero_crossing_rate(signal_samples, frame_size, hop_size)
     threshold = _adaptive_threshold(zcr, zcr_threshold_ratio)
     mask = _smooth_mask(zcr > threshold, hop_ms)
-    return _mask_to_segments(mask, hop_size, frame_size, len(signal_samples))
+    segments = _mask_to_segments(mask, hop_size, frame_size, len(signal_samples))
+    return _postprocess_segments(segments, fs)
 
 
 def detect_segments_energy_zcr(
@@ -209,7 +242,8 @@ def detect_segments_energy_zcr(
     noise_energy_floor = float(np.mean(noise_slice) + 2.0 * np.std(noise_slice))
     mask = (energy > energy_th) | ((zcr > zcr_th) & (energy > noise_energy_floor))
     mask = _smooth_mask(mask, hop_ms)
-    return _mask_to_segments(mask, hop_size, frame_size, len(signal_samples))
+    segments = _mask_to_segments(mask, hop_size, frame_size, len(signal_samples))
+    return _postprocess_segments(segments, fs)
 
 
 def detect_segments_entropy(
@@ -227,7 +261,8 @@ def detect_segments_entropy(
     entropy = compute_spectral_entropy(signal_samples, frame_size, hop_size)
     threshold = _adaptive_threshold(entropy, entropy_threshold_ratio)
     mask = _smooth_mask(entropy > threshold, hop_ms)
-    return _mask_to_segments(mask, hop_size, frame_size, len(signal_samples))
+    segments = _mask_to_segments(mask, hop_size, frame_size, len(signal_samples))
+    return _postprocess_segments(segments, fs)
 
 
 def detect_segments(
