@@ -1,3 +1,9 @@
-.idea
-.venv
+.idea/
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Local app output
 speech_dictionary.json
