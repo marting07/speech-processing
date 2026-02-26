@@ -80,43 +80,57 @@ def compute_spectral_entropy(
     return entropy
 
 
-def detect_segments(
-    signal_samples: np.ndarray,
-    fs: int,
-    method: str = "energy",
-    frame_ms: float = DEFAULT_FRAME_MS,
-    hop_ms: float = DEFAULT_HOP_MS,
-    energy_threshold_ratio: float = 0.1,
-    zcr_threshold_ratio: float = 0.1,
-    entropy_threshold_ratio: float = 0.1,
+def _adaptive_threshold(feature: np.ndarray, ratio: float) -> float:
+    """Estimate threshold using initial-noise statistics and global ratio."""
+    if feature.size == 0:
+        return 0.0
+    noise_frames = int(np.clip(np.ceil(0.1 * len(feature)), 5, 25))
+    noise_slice = feature[:noise_frames]
+    noise_mean = float(np.mean(noise_slice))
+    noise_std = float(np.std(noise_slice))
+    return max(ratio * float(np.max(feature)), noise_mean + 2.5 * noise_std)
+
+
+def _smooth_mask(raw_mask: np.ndarray, hop_ms: float) -> np.ndarray:
+    """Fill short gaps and suppress very short speech islands."""
+    mask = raw_mask.astype(bool).copy()
+    max_gap_frames = max(1, int(round(20.0 / hop_ms)))   # ~20 ms
+    min_run_frames = max(1, int(round(50.0 / hop_ms)))   # ~50 ms
+
+    idx = 0
+    while idx < len(mask):
+        if mask[idx]:
+            idx += 1
+            continue
+        gap_start = idx
+        while idx < len(mask) and not mask[idx]:
+            idx += 1
+        gap_end = idx
+        gap_len = gap_end - gap_start
+        left_speech = gap_start > 0 and mask[gap_start - 1]
+        right_speech = gap_end < len(mask) and mask[gap_end]
+        if left_speech and right_speech and gap_len <= max_gap_frames:
+            mask[gap_start:gap_end] = True
+
+    idx = 0
+    while idx < len(mask):
+        if not mask[idx]:
+            idx += 1
+            continue
+        run_start = idx
+        while idx < len(mask) and mask[idx]:
+            idx += 1
+        run_end = idx
+        if (run_end - run_start) < min_run_frames:
+            mask[run_start:run_end] = False
+
+    return mask
+
+
+def _mask_to_segments(
+    mask: np.ndarray, hop_size: int, frame_size: int, signal_len: int
 ) -> List[Tuple[int, int]]:
-    """Detect speech segments based on the chosen method."""
-    frame_size = int(fs * frame_ms / 1000)
-    hop_size = int(fs * hop_ms / 1000)
-    if len(signal_samples) < frame_size:
-        return []
-
-    if method == "energy":
-        feature = compute_short_time_energy(signal_samples, frame_size, hop_size)
-        threshold = energy_threshold_ratio * np.max(feature)
-        mask = feature > threshold
-    elif method == "zcr":
-        feature = compute_zero_crossing_rate(signal_samples, frame_size, hop_size)
-        threshold = zcr_threshold_ratio * np.max(feature)
-        mask = feature > threshold
-    elif method == "energy_zcr":
-        energy = compute_short_time_energy(signal_samples, frame_size, hop_size)
-        zcr = compute_zero_crossing_rate(signal_samples, frame_size, hop_size)
-        energy_th = energy_threshold_ratio * np.max(energy)
-        zcr_th = zcr_threshold_ratio * np.max(zcr)
-        mask = (energy > energy_th) | (zcr > zcr_th)
-    elif method == "entropy":
-        feature = compute_spectral_entropy(signal_samples, frame_size, hop_size)
-        threshold = entropy_threshold_ratio * np.max(feature)
-        mask = feature > threshold
-    else:
-        raise ValueError(f"Unknown segmentation method: {method}")
-
+    """Convert a boolean speech mask into sample-index segments."""
     segments: List[Tuple[int, int]] = []
     in_seg = False
     start_frame = 0
@@ -128,13 +142,139 @@ def detect_segments(
             in_seg = False
             end_frame = idx
             start_sample = start_frame * hop_size
-            end_sample = min(len(signal_samples), end_frame * hop_size + frame_size)
+            end_sample = min(signal_len, end_frame * hop_size + frame_size)
             segments.append((start_sample, end_sample))
     if in_seg:
         start_sample = start_frame * hop_size
-        end_sample = len(signal_samples)
+        end_sample = signal_len
         segments.append((start_sample, end_sample))
     return segments
+
+
+def detect_segments_energy(
+    signal_samples: np.ndarray,
+    fs: int,
+    frame_ms: float = DEFAULT_FRAME_MS,
+    hop_ms: float = DEFAULT_HOP_MS,
+    energy_threshold_ratio: float = 0.1,
+) -> List[Tuple[int, int]]:
+    """Detect speech segments using short-time energy."""
+    frame_size = int(fs * frame_ms / 1000)
+    hop_size = int(fs * hop_ms / 1000)
+    if len(signal_samples) < frame_size:
+        return []
+    energy = compute_short_time_energy(signal_samples, frame_size, hop_size)
+    threshold = _adaptive_threshold(energy, energy_threshold_ratio)
+    mask = _smooth_mask(energy > threshold, hop_ms)
+    return _mask_to_segments(mask, hop_size, frame_size, len(signal_samples))
+
+
+def detect_segments_zcr(
+    signal_samples: np.ndarray,
+    fs: int,
+    frame_ms: float = DEFAULT_FRAME_MS,
+    hop_ms: float = DEFAULT_HOP_MS,
+    zcr_threshold_ratio: float = 0.1,
+) -> List[Tuple[int, int]]:
+    """Detect speech segments using short-time zero crossing rate."""
+    frame_size = int(fs * frame_ms / 1000)
+    hop_size = int(fs * hop_ms / 1000)
+    if len(signal_samples) < frame_size:
+        return []
+    zcr = compute_zero_crossing_rate(signal_samples, frame_size, hop_size)
+    threshold = _adaptive_threshold(zcr, zcr_threshold_ratio)
+    mask = _smooth_mask(zcr > threshold, hop_ms)
+    return _mask_to_segments(mask, hop_size, frame_size, len(signal_samples))
+
+
+def detect_segments_energy_zcr(
+    signal_samples: np.ndarray,
+    fs: int,
+    frame_ms: float = DEFAULT_FRAME_MS,
+    hop_ms: float = DEFAULT_HOP_MS,
+    energy_threshold_ratio: float = 0.1,
+    zcr_threshold_ratio: float = 0.1,
+) -> List[Tuple[int, int]]:
+    """Detect speech segments using combined energy/ZCR criterion."""
+    frame_size = int(fs * frame_ms / 1000)
+    hop_size = int(fs * hop_ms / 1000)
+    if len(signal_samples) < frame_size:
+        return []
+    energy = compute_short_time_energy(signal_samples, frame_size, hop_size)
+    zcr = compute_zero_crossing_rate(signal_samples, frame_size, hop_size)
+    energy_th = _adaptive_threshold(energy, energy_threshold_ratio)
+    zcr_th = _adaptive_threshold(zcr, zcr_threshold_ratio)
+    noise_frames = int(np.clip(np.ceil(0.1 * len(energy)), 5, 25))
+    noise_slice = energy[:noise_frames]
+    noise_energy_floor = float(np.mean(noise_slice) + 2.0 * np.std(noise_slice))
+    mask = (energy > energy_th) | ((zcr > zcr_th) & (energy > noise_energy_floor))
+    mask = _smooth_mask(mask, hop_ms)
+    return _mask_to_segments(mask, hop_size, frame_size, len(signal_samples))
+
+
+def detect_segments_entropy(
+    signal_samples: np.ndarray,
+    fs: int,
+    frame_ms: float = DEFAULT_FRAME_MS,
+    hop_ms: float = DEFAULT_HOP_MS,
+    entropy_threshold_ratio: float = 0.1,
+) -> List[Tuple[int, int]]:
+    """Detect speech segments using spectral entropy."""
+    frame_size = int(fs * frame_ms / 1000)
+    hop_size = int(fs * hop_ms / 1000)
+    if len(signal_samples) < frame_size:
+        return []
+    entropy = compute_spectral_entropy(signal_samples, frame_size, hop_size)
+    threshold = _adaptive_threshold(entropy, entropy_threshold_ratio)
+    mask = _smooth_mask(entropy > threshold, hop_ms)
+    return _mask_to_segments(mask, hop_size, frame_size, len(signal_samples))
+
+
+def detect_segments(
+    signal_samples: np.ndarray,
+    fs: int,
+    method: str = "energy",
+    frame_ms: float = DEFAULT_FRAME_MS,
+    hop_ms: float = DEFAULT_HOP_MS,
+    energy_threshold_ratio: float = 0.1,
+    zcr_threshold_ratio: float = 0.1,
+    entropy_threshold_ratio: float = 0.1,
+) -> List[Tuple[int, int]]:
+    """Detect speech segments based on the chosen method."""
+    if method == "energy":
+        return detect_segments_energy(
+            signal_samples,
+            fs,
+            frame_ms=frame_ms,
+            hop_ms=hop_ms,
+            energy_threshold_ratio=energy_threshold_ratio,
+        )
+    if method == "zcr":
+        return detect_segments_zcr(
+            signal_samples,
+            fs,
+            frame_ms=frame_ms,
+            hop_ms=hop_ms,
+            zcr_threshold_ratio=zcr_threshold_ratio,
+        )
+    if method == "energy_zcr":
+        return detect_segments_energy_zcr(
+            signal_samples,
+            fs,
+            frame_ms=frame_ms,
+            hop_ms=hop_ms,
+            energy_threshold_ratio=energy_threshold_ratio,
+            zcr_threshold_ratio=zcr_threshold_ratio,
+        )
+    if method == "entropy":
+        return detect_segments_entropy(
+            signal_samples,
+            fs,
+            frame_ms=frame_ms,
+            hop_ms=hop_ms,
+            entropy_threshold_ratio=entropy_threshold_ratio,
+        )
+    raise ValueError(f"Unknown segmentation method: {method}")
 
 
 def compute_mel_filterbank(

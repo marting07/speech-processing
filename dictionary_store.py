@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Literal
 
 import numpy as np
 
@@ -48,8 +48,8 @@ def build_entry(
     fs: int,
     segment_seconds: Tuple[float, float],
     spectrogram: np.ndarray,
-    bark_energies: np.ndarray,
-    mfcc: np.ndarray,
+    feature_type: Literal["mfcc", "bark"],
+    feature_matrix: np.ndarray,
     frame_ms: float = DEFAULT_FRAME_MS,
     hop_ms: float = DEFAULT_HOP_MS,
     mel_filters: int = DEFAULT_MEL_FILTERS,
@@ -57,9 +57,10 @@ def build_entry(
     mel_fmax_hz: float = DEFAULT_MEL_FMAX_HZ,
 ) -> Dict[str, Any]:
     """Build one dictionary entry using the current JSON schema."""
-    return {
+    entry = {
         "schema_version": "2.0",
         "label": label,
+        "feature_type": feature_type,
         "sampling_rate_hz": fs,
         "frame_ms": frame_ms,
         "hop_ms": hop_ms,
@@ -70,35 +71,59 @@ def build_entry(
             "num_bins": int(spectrogram.shape[1]) if spectrogram.size > 0 else 0,
             "matrix": spectrogram.tolist(),
         },
-        "bark_energies": {
-            "num_bands": 16,
-            "num_frames": int(bark_energies.shape[0]),
-            "frames": matrix_to_indexed_rows(bark_energies, "band_energies"),
-        },
-        "mfcc": {
+    }
+    if feature_type == "mfcc":
+        entry["mfcc"] = {
             "num_filters": mel_filters,
             "num_coefficients": mel_filters,
             "fmin_hz": mel_fmin_hz,
             "fmax_hz": mel_fmax_hz,
-            "num_frames": int(mfcc.shape[0]),
-            "frames": matrix_to_indexed_rows(mfcc, "coefficients"),
-        },
-    }
+            "num_frames": int(feature_matrix.shape[0]),
+            "frames": matrix_to_indexed_rows(feature_matrix, "coefficients"),
+        }
+    else:
+        entry["bark_energies"] = {
+            "num_bands": 16,
+            "num_frames": int(feature_matrix.shape[0]),
+            "frames": matrix_to_indexed_rows(feature_matrix, "band_energies"),
+        }
+    return entry
+
+
+def extract_entry_bark(entry: Dict[str, Any]) -> np.ndarray:
+    """Extract Bark-band matrix from dictionary schema."""
+    bark_field = entry.get("bark_energies")
+    if not isinstance(bark_field, dict):
+        return np.empty((0, 0), dtype=float)
+    rows = bark_field.get("frames", [])
+    matrix = [row.get("band_energies", []) for row in rows if isinstance(row, dict)]
+    return np.array(matrix, dtype=float)
+
+
+def extract_entry_feature(entry: Dict[str, Any], feature_type: Literal["mfcc", "bark"]) -> np.ndarray:
+    """Extract selected feature matrix from an entry."""
+    if feature_type == "mfcc":
+        return extract_entry_mfcc(entry)
+    return extract_entry_bark(entry)
 
 
 def find_best_match_label(
     dictionary: List[Dict[str, Any]],
-    query_mfcc: np.ndarray,
+    query_features: np.ndarray,
+    feature_type: Literal["mfcc", "bark"],
 ) -> Tuple[Optional[str], Optional[float]]:
-    """Find closest dictionary label for query MFCC using DTW."""
+    """Find closest dictionary label for query features using DTW."""
     best_label: Optional[str] = None
     best_distance: Optional[float] = None
     for entry in dictionary:
-        entry_mfcc = extract_entry_mfcc(entry)
-        if entry_mfcc is None or entry_mfcc.size == 0:
+        entry_feature_type = entry.get("feature_type", "mfcc")
+        if entry_feature_type != feature_type:
+            continue
+        entry_features = extract_entry_feature(entry, feature_type)
+        if entry_features is None or entry_features.size == 0:
             continue
         try:
-            distance = dtw_distance(query_mfcc, entry_mfcc)
+            distance = dtw_distance(query_features, entry_features)
         except Exception:
             continue
         if best_distance is None or distance < best_distance:

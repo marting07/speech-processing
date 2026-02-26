@@ -97,10 +97,19 @@ class SpeechRecognitionApp(QMainWindow):
         self.segment_btn.clicked.connect(self.segment_audio)
         controls_layout.addWidget(self.segment_btn)
 
+        self.clear_segments_btn = QPushButton("Clear Segments")
+        self.clear_segments_btn.clicked.connect(self.clear_segments)
+        controls_layout.addWidget(self.clear_segments_btn)
+
         self.method_combo = QComboBox()
         self.method_combo.addItems(["energy", "zcr", "energy_zcr", "entropy"])
         controls_layout.addWidget(QLabel("Method:"))
         controls_layout.addWidget(self.method_combo)
+
+        self.feature_combo = QComboBox()
+        self.feature_combo.addItems(["mfcc", "bark"])
+        controls_layout.addWidget(QLabel("Features:"))
+        controls_layout.addWidget(self.feature_combo)
 
         self.save_btn = QPushButton("Save Segment")
         self.save_btn.clicked.connect(self.save_segment)
@@ -213,6 +222,12 @@ class SpeechRecognitionApp(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Segmentation Error", str(exc))
 
+    def clear_segments(self):
+        """Clear current segmentation markers from the waveform."""
+        self.segments = []
+        self.status_label.setText("Segmentation cleared.")
+        self.plot_waveform()
+
     def save_segment(self):
         """Save a selected segment with label and extracted features."""
         if self.audio_data.size == 0 or not self.segments:
@@ -243,30 +258,40 @@ class SpeechRecognitionApp(QMainWindow):
             frame_ms=DEFAULT_FRAME_MS,
             hop_ms=DEFAULT_HOP_MS,
         )
-        mfcc_feat = compute_mfcc(
-            segment_samples,
-            self.fs,
-            num_filters=DEFAULT_MEL_FILTERS,
-            num_ceps=DEFAULT_MEL_FILTERS,
-            frame_ms=DEFAULT_FRAME_MS,
-            hop_ms=DEFAULT_HOP_MS,
-            fmin=DEFAULT_MEL_FMIN_HZ,
-            fmax=DEFAULT_MEL_FMAX_HZ,
-        )
-        bark_feat = compute_bark_band_energies(
-            segment_samples,
-            self.fs,
-            frame_ms=DEFAULT_FRAME_MS,
-            hop_ms=DEFAULT_HOP_MS,
-        )
+        feature_type = self.feature_combo.currentText()
+        if feature_type == "mfcc":
+            feature_matrix = compute_mfcc(
+                segment_samples,
+                self.fs,
+                num_filters=DEFAULT_MEL_FILTERS,
+                num_ceps=DEFAULT_MEL_FILTERS,
+                frame_ms=DEFAULT_FRAME_MS,
+                hop_ms=DEFAULT_HOP_MS,
+                fmin=DEFAULT_MEL_FMIN_HZ,
+                fmax=DEFAULT_MEL_FMAX_HZ,
+            )
+        else:
+            feature_matrix = compute_bark_band_energies(
+                segment_samples,
+                self.fs,
+                frame_ms=DEFAULT_FRAME_MS,
+                hop_ms=DEFAULT_HOP_MS,
+            )
+        if feature_matrix.size == 0:
+            QMessageBox.information(
+                self,
+                "No features",
+                f"Could not extract {feature_type} features from the selected segment.",
+            )
+            return
 
         entry = build_entry(
             label=label,
             fs=self.fs,
             segment_seconds=(start / self.fs, end / self.fs),
             spectrogram=spect,
-            bark_energies=bark_feat,
-            mfcc=mfcc_feat,
+            feature_type=feature_type,
+            feature_matrix=feature_matrix,
             frame_ms=DEFAULT_FRAME_MS,
             hop_ms=DEFAULT_HOP_MS,
             mel_filters=DEFAULT_MEL_FILTERS,
@@ -299,24 +324,45 @@ class SpeechRecognitionApp(QMainWindow):
         except AudioIOError as exc:
             QMessageBox.critical(self, "Recording Error", str(exc))
             return
-        new_mfcc = compute_mfcc(
-            new_samples,
-            self.fs,
-            num_filters=DEFAULT_MEL_FILTERS,
-            num_ceps=DEFAULT_MEL_FILTERS,
-            frame_ms=DEFAULT_FRAME_MS,
-            hop_ms=DEFAULT_HOP_MS,
-            fmin=DEFAULT_MEL_FMIN_HZ,
-            fmax=DEFAULT_MEL_FMAX_HZ,
-        )
-        if new_mfcc.size == 0:
-            QMessageBox.information(self, "No features", "Could not extract features from the recording.")
+        feature_type = self.feature_combo.currentText()
+        if feature_type == "mfcc":
+            query_features = compute_mfcc(
+                new_samples,
+                self.fs,
+                num_filters=DEFAULT_MEL_FILTERS,
+                num_ceps=DEFAULT_MEL_FILTERS,
+                frame_ms=DEFAULT_FRAME_MS,
+                hop_ms=DEFAULT_HOP_MS,
+                fmin=DEFAULT_MEL_FMIN_HZ,
+                fmax=DEFAULT_MEL_FMAX_HZ,
+            )
+        else:
+            query_features = compute_bark_band_energies(
+                new_samples,
+                self.fs,
+                frame_ms=DEFAULT_FRAME_MS,
+                hop_ms=DEFAULT_HOP_MS,
+            )
+        if query_features.size == 0:
+            QMessageBox.information(
+                self,
+                "No features",
+                f"Could not extract {feature_type} features from the recording.",
+            )
             return
 
-        best_label, best_distance = find_best_match_label(dictionary, new_mfcc)
+        best_label, best_distance = find_best_match_label(
+            dictionary,
+            query_features,
+            feature_type,
+        )
 
         if best_label is None:
-            QMessageBox.information(self, "No match", "Unable to compare with dictionary entries.")
+            QMessageBox.information(
+                self,
+                "No match",
+                f"No comparable entries found for feature type '{feature_type}'.",
+            )
         else:
             QMessageBox.information(
                 self,
