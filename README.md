@@ -13,6 +13,10 @@ Desktop app for recording speech, segmenting isolated words, extracting features
   - Spectrogram frames
   - One selected feature matrix (`mfcc`/`bark`/`lpc`/`wavelet`) per entry
 - Compare selected segmented utterances against dictionary entries using Dynamic Time Warping (DTW).
+- Compare using selectable backends:
+  - `dtw`
+  - `hmm-discrete` (with clustering + vector codebook quantization)
+  - `hmm-continuous` (Gaussian emissions)
 - Visualize **Spectrogram** and **Cepstrogram** from recorded audio/segments.
 - Visualize **Wavelet Scalogram** (frame-scale energy diagram).
 - Run **LPC Speech Synthesis** (analyze/resynthesize) and playback.
@@ -23,6 +27,7 @@ Desktop app for recording speech, segmenting isolated words, extracting features
 
 - `speech_recognition_app.py`: PyQt6 UI and user interaction flow only.
 - `speech_dsp.py`: digital signal processing and feature extraction logic.
+- `speech_hmm.py`: HMM recognition backends (discrete and continuous).
 - `dictionary_store.py`: dictionary schema creation, persistence, and lookup helpers.
 - `audio_io.py`: audio capture/playback adapter over `sounddevice`.
 
@@ -38,6 +43,9 @@ The current implementation is configured with:
 - MFCC: `15` Mel filters/coefficients, `fmin=80 Hz`, `fmax=4000 Hz`
 - LPC order: `12` (common recommendation for `8 kHz`)
 - Wavelet scales: `6..24`
+- HMM states: `5`
+- Discrete HMM codebook size: `32`
+- HMM training iterations: `10`
 
 ## Requirements
 
@@ -63,7 +71,8 @@ python3 speech_recognition_app.py
 6. Optionally run **Synthesize LPC** then **Play LPC**.
 7. Choose **Features** (`mfcc`/`bark`/`lpc`/`wavelet`) and **Segment pick** (`manual` or `auto-best`), then click **Save Segment** and enter a label.
 8. Repeat to build dictionary entries.
-9. Use the same **Features** mode and click **Compare** to match a segment against dictionary entries.
+9. Select **Recognition backend** (`dtw`, `hmm-discrete`, `hmm-continuous`).
+10. Use the same **Features** mode and click **Compare** to match a segment against dictionary entries.
 
 ## Recommended Ranges (UI Labels)
 
@@ -73,6 +82,9 @@ python3 speech_recognition_app.py
 - Energy/ZCR/Entropy threshold ratios: `0.05-0.20`
 - LPC order at `8 kHz`: `10-14` (default `12`)
 - Wavelet scales: `6-24`
+- HMM states: `4-8`
+- Discrete codebook size: `16-64`
+- HMM iterations: `5-15`
 
 ## Dictionary File
 

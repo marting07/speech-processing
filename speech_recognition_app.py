@@ -75,8 +75,10 @@ from dictionary_store import (
     append_entry,
     build_entry,
     find_best_match_label,
+    group_feature_sequences_by_label,
     load_dictionary,
 )
+from speech_hmm import recognize_with_hmm_discrete, recognize_with_hmm_continuous
 from audio_io import AudioIOError, is_available, play_audio as play_audio_buffer, record_audio, stop_playback
 
 
@@ -134,6 +136,8 @@ class SpeechRecognitionApp(QMainWindow):
 
         self.segment_pick_combo = QComboBox()
         self.segment_pick_combo.addItems(["manual", "auto-best"])
+        self.recognition_backend_combo = QComboBox()
+        self.recognition_backend_combo.addItems(["dtw", "hmm-discrete", "hmm-continuous"])
 
         self.save_btn = QPushButton("Save Segment")
         self.save_btn.clicked.connect(self.save_segment)
@@ -187,6 +191,7 @@ class SpeechRecognitionApp(QMainWindow):
         mode_layout.addRow("Segmentation method", self.method_combo)
         mode_layout.addRow("Feature extraction", self.feature_combo)
         mode_layout.addRow("Segment selection", self.segment_pick_combo)
+        mode_layout.addRow("Recognition backend", self.recognition_backend_combo)
         panel_layout.addWidget(mode_group)
 
         self.advanced_toggle_btn = QToolButton()
@@ -290,6 +295,30 @@ class SpeechRecognitionApp(QMainWindow):
         wavelet_layout.addWidget(self.wavelet_max_scale_spin)
         params_layout.addLayout(wavelet_layout, row, 1)
         params_layout.addWidget(QLabel("Rec: 6-24"), row, 2)
+        row += 1
+
+        params_layout.addWidget(QLabel("HMM states"), row, 0)
+        self.hmm_states_spin = QSpinBox()
+        self.hmm_states_spin.setRange(2, 12)
+        self.hmm_states_spin.setValue(5)
+        params_layout.addWidget(self.hmm_states_spin, row, 1)
+        params_layout.addWidget(QLabel("Rec: 4-8"), row, 2)
+        row += 1
+
+        params_layout.addWidget(QLabel("Codebook size"), row, 0)
+        self.codebook_size_spin = QSpinBox()
+        self.codebook_size_spin.setRange(8, 128)
+        self.codebook_size_spin.setValue(32)
+        params_layout.addWidget(self.codebook_size_spin, row, 1)
+        params_layout.addWidget(QLabel("Discrete HMM: 16-64"), row, 2)
+        row += 1
+
+        params_layout.addWidget(QLabel("HMM iterations"), row, 0)
+        self.hmm_iters_spin = QSpinBox()
+        self.hmm_iters_spin.setRange(1, 40)
+        self.hmm_iters_spin.setValue(10)
+        params_layout.addWidget(self.hmm_iters_spin, row, 1)
+        params_layout.addWidget(QLabel("Rec: 5-15"), row, 2)
         panel_layout.addWidget(params_group)
         self.params_group.setVisible(False)
 
@@ -316,6 +345,9 @@ class SpeechRecognitionApp(QMainWindow):
             "lpc_order": int(self.lpc_order_spin.value()),
             "wav_min": int(self.wavelet_min_scale_spin.value()),
             "wav_max": int(self.wavelet_max_scale_spin.value()),
+            "hmm_states": int(self.hmm_states_spin.value()),
+            "codebook_size": int(self.codebook_size_spin.value()),
+            "hmm_iters": int(self.hmm_iters_spin.value()),
         }
 
     def apply_preset(self):
@@ -331,6 +363,9 @@ class SpeechRecognitionApp(QMainWindow):
             self.lpc_order_spin.setValue(12)
             self.wavelet_min_scale_spin.setValue(6)
             self.wavelet_max_scale_spin.setValue(24)
+            self.hmm_states_spin.setValue(5)
+            self.codebook_size_spin.setValue(32)
+            self.hmm_iters_spin.setValue(10)
         elif preset == "Noisy Room":
             self.frame_ms_spin.setValue(35.0)
             self.hop_ms_spin.setValue(12.0)
@@ -341,6 +376,9 @@ class SpeechRecognitionApp(QMainWindow):
             self.lpc_order_spin.setValue(12)
             self.wavelet_min_scale_spin.setValue(8)
             self.wavelet_max_scale_spin.setValue(28)
+            self.hmm_states_spin.setValue(6)
+            self.codebook_size_spin.setValue(40)
+            self.hmm_iters_spin.setValue(12)
         elif preset == "Fast Speech":
             self.frame_ms_spin.setValue(25.0)
             self.hop_ms_spin.setValue(8.0)
@@ -351,6 +389,9 @@ class SpeechRecognitionApp(QMainWindow):
             self.lpc_order_spin.setValue(12)
             self.wavelet_min_scale_spin.setValue(6)
             self.wavelet_max_scale_spin.setValue(22)
+            self.hmm_states_spin.setValue(5)
+            self.codebook_size_spin.setValue(28)
+            self.hmm_iters_spin.setValue(8)
         self.status_label.setText(f"Preset applied: {preset}")
 
     def _select_audio_for_view(self) -> np.ndarray:
@@ -819,6 +860,24 @@ class SpeechRecognitionApp(QMainWindow):
             query_features,
             feature_type,
         )
+        backend = self.recognition_backend_combo.currentText()
+        if backend != "dtw":
+            grouped = group_feature_sequences_by_label(dictionary, feature_type)
+            if backend == "hmm-discrete":
+                best_label, best_distance = recognize_with_hmm_discrete(
+                    grouped,
+                    query_features,
+                    n_states=params["hmm_states"],
+                    codebook_size=params["codebook_size"],
+                    n_iters=params["hmm_iters"],
+                )
+            else:
+                best_label, best_distance = recognize_with_hmm_continuous(
+                    grouped,
+                    query_features,
+                    n_states=params["hmm_states"],
+                    n_iters=params["hmm_iters"],
+                )
 
         if best_label is None:
             QMessageBox.information(
@@ -830,7 +889,7 @@ class SpeechRecognitionApp(QMainWindow):
             QMessageBox.information(
                 self,
                 "Recognition Result",
-                f"Closest match: {best_label} (distance={best_distance:.3f})",
+                f"Closest match: {best_label} (score={best_distance:.3f}, backend={backend})",
             )
 
 

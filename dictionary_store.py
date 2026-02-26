@@ -179,3 +179,22 @@ def find_best_match_label(
             best_distance = distance
             best_label = entry.get("label")
     return best_label, best_distance
+
+
+def group_feature_sequences_by_label(
+    dictionary: List[Dict[str, Any]],
+    feature_type: Literal["mfcc", "bark", "lpc", "wavelet"],
+) -> Dict[str, List[np.ndarray]]:
+    """Group feature matrices by label for model-based training."""
+    grouped: Dict[str, List[np.ndarray]] = {}
+    for entry in dictionary:
+        if entry.get("feature_type", "mfcc") != feature_type:
+            continue
+        label = entry.get("label")
+        if not label:
+            continue
+        mat = extract_entry_feature(entry, feature_type)
+        if mat.size == 0 or mat.ndim != 2:
+            continue
+        grouped.setdefault(label, []).append(mat.astype(float))
+    return grouped
