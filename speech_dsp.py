@@ -68,6 +68,51 @@ def compute_short_time_energy(
     return energy
 
 
+def compute_energy_trajectory(
+    signal_samples: np.ndarray,
+    fs: int,
+    frame_ms: float = DEFAULT_FRAME_MS,
+    hop_ms: float = DEFAULT_HOP_MS,
+    pre_emphasis: float = DEFAULT_PRE_EMPHASIS,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute normalized short-time energy trajectory and time axis."""
+    frame_size = int(fs * frame_ms / 1000)
+    hop_size = int(fs * hop_ms / 1000)
+    emphasized = apply_pre_emphasis(signal_samples, pre_emphasis)
+    if emphasized.size < frame_size:
+        return np.array([]), np.array([])
+    energy = compute_short_time_energy(emphasized, frame_size, hop_size)
+    energy = energy / (np.max(energy) + 1e-12)
+    times = (np.arange(len(energy)) * hop_size + frame_size / 2) / fs
+    return times, energy
+
+
+def kalman_filter_1d(
+    measurements: np.ndarray,
+    process_var: float = 1e-4,
+    measurement_var: float = 1e-2,
+    init_state: float = None,
+    init_var: float = 1.0,
+) -> np.ndarray:
+    """Apply scalar Kalman filter to a 1-D measurement sequence."""
+    if measurements.size == 0:
+        return np.array([])
+    q = max(process_var, 1e-12)
+    r = max(measurement_var, 1e-12)
+    x = float(measurements[0] if init_state is None else init_state)
+    p = max(init_var, 1e-12)
+    out = np.zeros_like(measurements, dtype=float)
+    for i, z in enumerate(measurements):
+        # Predict
+        p = p + q
+        # Update
+        k = p / (p + r)
+        x = x + k * (float(z) - x)
+        p = (1.0 - k) * p
+        out[i] = x
+    return out
+
+
 def compute_zero_crossing_rate(
     signal_samples: np.ndarray, frame_size: int, hop_size: int
 ) -> np.ndarray:

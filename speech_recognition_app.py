@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 
 try:
     from PyQt6 import QtWidgets
+    from PyQt6.QtGui import QAction
+    from PyQt6.QtCore import QTimer
     from PyQt6.QtWidgets import (
         QApplication,
         QMainWindow,
@@ -26,11 +28,14 @@ try:
         QScrollArea,
         QFormLayout,
         QToolButton,
+        QStackedWidget,
     )
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
     from matplotlib.figure import Figure
 except ImportError:
     QtWidgets = None
+    QAction = object
+    QTimer = object
     QApplication = None
     QMainWindow = object
     QWidget = object
@@ -48,6 +53,7 @@ except ImportError:
     QScrollArea = object
     QFormLayout = object
     QToolButton = object
+    QStackedWidget = object
     FigureCanvas = None
     Figure = None
 
@@ -62,13 +68,16 @@ from speech_dsp import (
     DEFAULT_LPC_ORDER,
     DEFAULT_WAVELET_MIN_SCALE,
     DEFAULT_WAVELET_MAX_SCALE,
+    apply_pre_emphasis,
     compute_bark_band_energies,
     compute_cepstrogram,
+    compute_energy_trajectory,
     compute_lpc_features,
     compute_mfcc,
     compute_spectrogram,
     compute_wavelet_features,
     detect_segments,
+    kalman_filter_1d,
     synthesize_lpc_speech,
 )
 from dictionary_store import (
@@ -80,6 +89,7 @@ from dictionary_store import (
 )
 from speech_hmm import recognize_with_hmm_discrete, recognize_with_hmm_continuous
 from audio_io import AudioIOError, is_available, play_audio as play_audio_buffer, record_audio, stop_playback
+from audio_io import RealtimeAudioStream
 
 
 class SpeechRecognitionApp(QMainWindow):
@@ -96,13 +106,51 @@ class SpeechRecognitionApp(QMainWindow):
         self.segments: List[Tuple[int, int]] = []
         self.dictionary_file = "speech_dictionary.json"
         self.lpc_synth_audio: np.ndarray = np.array([])
+        self.rt_stream = None
+        self.rt_timer = QTimer(self)
+        self.rt_timer.setInterval(40)
+        self.rt_timer.timeout.connect(self._on_realtime_kalman_tick)
+        self.rt_pending_samples = np.array([], dtype=np.float32)
+        self.rt_time = []
+        self.rt_measured = []
+        self.rt_estimated = []
+        self.rt_residuals = []
+        self.rt_confidence = 0.0
+        self.rt_frame_index = 0
+        self.rt_energy_scale = 1e-12
+        self.rt_kf_state = 0.0
+        self.rt_kf_var = 1.0
+        self.rt_running = False
         self.init_ui()
 
     def init_ui(self):
-        """Initialize all GUI components."""
+        """Initialize all GUI components with mode switching."""
         central = QWidget()
         self.setCentralWidget(central)
         root_layout = QVBoxLayout(central)
+
+        self.mode_stack = QStackedWidget()
+        root_layout.addWidget(self.mode_stack)
+
+        recognition_page = QWidget()
+        kalman_page = QWidget()
+        self.mode_stack.addWidget(recognition_page)
+        self.mode_stack.addWidget(kalman_page)
+
+        self._build_recognition_page(recognition_page)
+        self._build_kalman_page(kalman_page)
+
+        mode_menu = self.menuBar().addMenu("Mode")
+        rec_action = QAction("Speech Recognition", self)
+        rec_action.triggered.connect(self._switch_to_recognition)
+        mode_menu.addAction(rec_action)
+        kalman_action = QAction("Kalman Speech Following", self)
+        kalman_action.triggered.connect(self._switch_to_kalman)
+        mode_menu.addAction(kalman_action)
+
+    def _build_recognition_page(self, page: QWidget):
+        """Build speech processing/recognition page."""
+        root_layout = QVBoxLayout(page)
 
         self.figure = Figure(figsize=(6, 3))
         self.canvas = FigureCanvas(self.figure)
@@ -326,6 +374,197 @@ class SpeechRecognitionApp(QMainWindow):
         self.status_label.setWordWrap(True)
         panel_layout.addWidget(self.status_label)
 
+    def _build_kalman_page(self, page: QWidget):
+        """Build Kalman speech-following demo page."""
+        layout = QVBoxLayout(page)
+
+        self.kalman_figure = Figure(figsize=(6, 3))
+        self.kalman_canvas = FigureCanvas(self.kalman_figure)
+        layout.addWidget(self.kalman_canvas, stretch=3)
+        self.kalman_ax = self.kalman_figure.add_subplot(111)
+        self.kalman_ax.set_title("Kalman Speech Following")
+        self.kalman_ax.set_xlabel("Time (s)")
+        self.kalman_ax.set_ylabel("Normalized Energy")
+
+        controls_group = QGroupBox("Kalman Demo Controls")
+        controls_layout = QGridLayout(controls_group)
+        layout.addWidget(controls_group, stretch=1)
+
+        controls_layout.addWidget(QLabel("Source"), 0, 0)
+        self.kalman_source_combo = QComboBox()
+        self.kalman_source_combo.addItems(["auto-best segment", "manual segment", "whole recording"])
+        controls_layout.addWidget(self.kalman_source_combo, 0, 1)
+
+        controls_layout.addWidget(QLabel("Process noise Q"), 1, 0)
+        self.kalman_q_spin = QDoubleSpinBox()
+        self.kalman_q_spin.setRange(0.000001, 1.0)
+        self.kalman_q_spin.setDecimals(6)
+        self.kalman_q_spin.setSingleStep(0.0001)
+        self.kalman_q_spin.setValue(0.0005)
+        controls_layout.addWidget(self.kalman_q_spin, 1, 1)
+        controls_layout.addWidget(QLabel("Rec: 1e-5 to 1e-2"), 1, 2)
+
+        controls_layout.addWidget(QLabel("Measurement noise R"), 2, 0)
+        self.kalman_r_spin = QDoubleSpinBox()
+        self.kalman_r_spin.setRange(0.000001, 1.0)
+        self.kalman_r_spin.setDecimals(6)
+        self.kalman_r_spin.setSingleStep(0.0001)
+        self.kalman_r_spin.setValue(0.01)
+        controls_layout.addWidget(self.kalman_r_spin, 2, 1)
+        controls_layout.addWidget(QLabel("Rec: 1e-3 to 1e-1"), 2, 2)
+
+        self.run_kalman_btn = QPushButton("Run Kalman Demo")
+        self.run_kalman_btn.clicked.connect(self.run_kalman_demo)
+        controls_layout.addWidget(self.run_kalman_btn, 3, 0)
+
+        self.play_kalman_source_btn = QPushButton("Play Source")
+        self.play_kalman_source_btn.clicked.connect(self.play_kalman_source)
+        controls_layout.addWidget(self.play_kalman_source_btn, 3, 1)
+
+        self.start_rt_kalman_btn = QPushButton("Start Live")
+        self.start_rt_kalman_btn.clicked.connect(self.start_realtime_kalman)
+        controls_layout.addWidget(self.start_rt_kalman_btn, 4, 0)
+
+        self.stop_rt_kalman_btn = QPushButton("Stop Live")
+        self.stop_rt_kalman_btn.clicked.connect(self.stop_realtime_kalman)
+        self.stop_rt_kalman_btn.setEnabled(False)
+        controls_layout.addWidget(self.stop_rt_kalman_btn, 4, 1)
+
+        self.kalman_status_label = QLabel("Record and segment speech, then run demo.")
+        self.kalman_status_label.setWordWrap(True)
+        layout.addWidget(self.kalman_status_label)
+
+    def _switch_to_recognition(self):
+        if self.rt_running:
+            self.stop_realtime_kalman()
+        self.mode_stack.setCurrentIndex(0)
+
+    def _switch_to_kalman(self):
+        self.mode_stack.setCurrentIndex(1)
+
+    def _reset_realtime_kalman_buffers(self):
+        self.rt_pending_samples = np.array([], dtype=np.float32)
+        self.rt_time = []
+        self.rt_measured = []
+        self.rt_estimated = []
+        self.rt_residuals = []
+        self.rt_confidence = 0.0
+        self.rt_frame_index = 0
+        self.rt_energy_scale = 1e-12
+        self.rt_kf_state = 0.0
+        self.rt_kf_var = 1.0
+
+    def start_realtime_kalman(self):
+        """Start live microphone Kalman following."""
+        if self.rt_running:
+            return
+        if not is_available():
+            QMessageBox.critical(self, "Missing Dependency", "sounddevice is not installed.")
+            return
+        try:
+            params = self._current_params()
+            hop_size = int(self.fs * params["hop_ms"] / 1000.0)
+            blocksize = max(128, hop_size)
+            self.rt_stream = RealtimeAudioStream(self.fs, blocksize=blocksize)
+            self.rt_stream.start()
+            self._reset_realtime_kalman_buffers()
+            self.rt_running = True
+            self.rt_timer.start()
+            self.start_rt_kalman_btn.setEnabled(False)
+            self.stop_rt_kalman_btn.setEnabled(True)
+            self.kalman_status_label.setText("Live Kalman running...")
+        except Exception as exc:
+            self.rt_running = False
+            self.rt_stream = None
+            QMessageBox.critical(self, "Live Kalman Error", str(exc))
+
+    def stop_realtime_kalman(self):
+        """Stop live microphone Kalman following."""
+        if not self.rt_running and self.rt_stream is None:
+            return
+        self.rt_timer.stop()
+        if self.rt_stream is not None:
+            try:
+                self.rt_stream.stop()
+            except Exception:
+                pass
+            self.rt_stream = None
+        self.rt_running = False
+        self.start_rt_kalman_btn.setEnabled(True)
+        self.stop_rt_kalman_btn.setEnabled(False)
+        self.kalman_status_label.setText("Live Kalman stopped.")
+
+    def _on_realtime_kalman_tick(self):
+        """Process incoming microphone chunks and update Kalman plot."""
+        if not self.rt_running or self.rt_stream is None:
+            return
+        params = self._current_params()
+        frame_size = int(self.fs * params["frame_ms"] / 1000.0)
+        hop_size = int(self.fs * params["hop_ms"] / 1000.0)
+        q = float(self.kalman_q_spin.value())
+        r = float(self.kalman_r_spin.value())
+
+        chunks = self.rt_stream.read_chunks(max_chunks=128)
+        if not chunks:
+            return
+        self.rt_pending_samples = np.concatenate([self.rt_pending_samples] + chunks).astype(np.float32)
+
+        updated = False
+        while self.rt_pending_samples.size >= frame_size:
+            frame = self.rt_pending_samples[:frame_size]
+            self.rt_pending_samples = self.rt_pending_samples[hop_size:]
+            frame_emph = apply_pre_emphasis(frame, params["pre_emphasis"])
+            energy = float(np.mean(frame_emph ** 2))
+            self.rt_energy_scale = max(self.rt_energy_scale, energy)
+            z = energy / (self.rt_energy_scale + 1e-12)
+
+            # Scalar Kalman step.
+            self.rt_kf_var = self.rt_kf_var + q
+            k = self.rt_kf_var / (self.rt_kf_var + r)
+            innovation = z - self.rt_kf_state
+            self.rt_kf_state = self.rt_kf_state + k * innovation
+            self.rt_kf_var = (1.0 - k) * self.rt_kf_var
+
+            t = (self.rt_frame_index * hop_size + frame_size / 2) / self.fs
+            self.rt_frame_index += 1
+            self.rt_time.append(t)
+            self.rt_measured.append(z)
+            self.rt_estimated.append(self.rt_kf_state)
+            self.rt_residuals.append(innovation)
+            updated = True
+
+        if not updated:
+            return
+
+        # Keep latest window for responsiveness.
+        max_points = 800
+        if len(self.rt_time) > max_points:
+            self.rt_time = self.rt_time[-max_points:]
+            self.rt_measured = self.rt_measured[-max_points:]
+            self.rt_estimated = self.rt_estimated[-max_points:]
+            self.rt_residuals = self.rt_residuals[-max_points:]
+
+        residual_window = self.rt_residuals[-120:]
+        if len(residual_window) >= 8:
+            residual_std = float(np.std(residual_window))
+            # Smaller innovation spread means the model is following measurements stably.
+            self.rt_confidence = float(np.clip(100.0 * (1.0 - residual_std), 0.0, 100.0))
+        else:
+            self.rt_confidence = 0.0
+
+        self.kalman_ax.clear()
+        self.kalman_ax.plot(self.rt_time, self.rt_measured, label="Measured Energy", color="tab:blue", alpha=0.7)
+        self.kalman_ax.plot(self.rt_time, self.rt_estimated, label="Kalman Estimate", color="tab:red", linewidth=2.0)
+        self.kalman_ax.set_title(f"Kalman Speech Following (Live) - Confidence {self.rt_confidence:.1f}%")
+        self.kalman_ax.set_xlabel("Time (s)")
+        self.kalman_ax.set_ylabel("Normalized Energy")
+        self.kalman_ax.grid(True, alpha=0.2)
+        self.kalman_ax.legend(loc="upper right")
+        self.kalman_canvas.draw()
+        self.kalman_status_label.setText(
+            f"Live Kalman running: {len(self.rt_estimated)} frames, confidence {self.rt_confidence:.1f}%."
+        )
+
     def toggle_advanced_params(self, expanded: bool):
         """Expand/collapse advanced DSP parameter controls."""
         self.params_group.setVisible(expanded)
@@ -459,6 +698,82 @@ class SpeechRecognitionApp(QMainWindow):
             return -1
         return segment_items.index(segment_index)
 
+    def _select_audio_for_kalman(self) -> np.ndarray:
+        """Select source audio for Kalman demo according to source mode."""
+        if self.audio_data.size == 0:
+            return np.array([])
+        mode = self.kalman_source_combo.currentText()
+        if mode == "whole recording" or not self.segments:
+            return self.audio_data
+        if mode == "auto-best segment":
+            idx = self._best_segment_index()
+            if idx < 0:
+                return np.array([])
+            start, end = self.segments[idx]
+            return self.audio_data[start:end]
+        # manual segment
+        idx = self._select_segment_index("use in Kalman demo")
+        if idx < 0:
+            return np.array([])
+        start, end = self.segments[idx]
+        return self.audio_data[start:end]
+
+    def run_kalman_demo(self):
+        """Run Kalman tracking over short-time energy and plot following behavior."""
+        if self.audio_data.size == 0:
+            QMessageBox.warning(self, "No audio", "Please record audio first.")
+            return
+        params = self._current_params()
+        samples = self._select_audio_for_kalman()
+        if samples.size == 0:
+            return
+        times, energy = compute_energy_trajectory(
+            samples,
+            self.fs,
+            frame_ms=params["frame_ms"],
+            hop_ms=params["hop_ms"],
+            pre_emphasis=params["pre_emphasis"],
+        )
+        if energy.size == 0:
+            QMessageBox.information(self, "No data", "Not enough audio for Kalman demo.")
+            return
+        estimate = kalman_filter_1d(
+            energy,
+            process_var=float(self.kalman_q_spin.value()),
+            measurement_var=float(self.kalman_r_spin.value()),
+            init_state=float(energy[0]),
+            init_var=1.0,
+        )
+        self.kalman_ax.clear()
+        self.kalman_ax.plot(times, energy, label="Measured Energy", color="tab:blue", alpha=0.7)
+        self.kalman_ax.plot(times, estimate, label="Kalman Estimate", color="tab:red", linewidth=2.0)
+        self.kalman_ax.set_title("Kalman Speech Following (Energy Tracking)")
+        self.kalman_ax.set_xlabel("Time (s)")
+        self.kalman_ax.set_ylabel("Normalized Energy")
+        self.kalman_ax.grid(True, alpha=0.2)
+        self.kalman_ax.legend(loc="upper right")
+        self.kalman_canvas.draw()
+        self.kalman_status_label.setText(
+            f"Kalman demo done: {len(energy)} frames, Q={self.kalman_q_spin.value():.6f}, R={self.kalman_r_spin.value():.6f}."
+        )
+
+    def play_kalman_source(self):
+        """Play currently selected Kalman source audio."""
+        if not is_available():
+            QMessageBox.critical(self, "Missing Dependency", "sounddevice is not installed.")
+            return
+        samples = self._select_audio_for_kalman()
+        if samples.size == 0:
+            return
+        try:
+            try:
+                stop_playback()
+            except Exception:
+                pass
+            play_audio_buffer(samples, self.fs, blocking=False)
+        except AudioIOError as exc:
+            QMessageBox.critical(self, "Playback Error", str(exc))
+
     def show_spectrogram_view(self):
         """Display spectrogram for selected audio."""
         params = self._current_params()
@@ -573,6 +888,14 @@ class SpeechRecognitionApp(QMainWindow):
             play_audio_buffer(self.lpc_synth_audio, self.fs, blocking=False)
         except AudioIOError as exc:
             QMessageBox.critical(self, "Playback Error", str(exc))
+
+    def closeEvent(self, event):
+        """Ensure realtime resources are released on app close."""
+        try:
+            self.stop_realtime_kalman()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     def record_audio(self):
         """Record audio from the microphone and plot the waveform."""
