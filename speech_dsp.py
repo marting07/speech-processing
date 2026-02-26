@@ -13,6 +13,16 @@ DEFAULT_HOP_MS = 10.0
 DEFAULT_MEL_FILTERS = 15
 DEFAULT_MEL_FMIN_HZ = 80.0
 DEFAULT_MEL_FMAX_HZ = 4000.0
+DEFAULT_PRE_EMPHASIS = 0.97
+DEFAULT_LPC_ORDER = 12
+DEFAULT_WAVELET_MIN_SCALE = 6
+DEFAULT_WAVELET_MAX_SCALE = 24
+
+# Segmentation tuning constants.
+ADAPTIVE_NOISE_STD_FACTOR = 2.8
+NOISE_HEAD_FRACTION = 0.10
+NOISE_LOWEST_FRACTION = 0.20
+ZCR_ENERGY_FLOOR_STD_FACTOR = 2.5
 
 # Bark critical bands 1..16 from the notes (band 0 is excluded).
 BARK_BAND_LIMITS_HZ = [
@@ -33,6 +43,16 @@ BARK_BAND_LIMITS_HZ = [
     (2700, 3150),
     (3150, 3700),
 ]
+
+
+def apply_pre_emphasis(signal_samples: np.ndarray, coeff: float = DEFAULT_PRE_EMPHASIS) -> np.ndarray:
+    """Apply first-order pre-emphasis filter y[n]=x[n]-a*x[n-1]."""
+    if signal_samples.size == 0:
+        return signal_samples.astype(float)
+    x = signal_samples.astype(float)
+    if coeff <= 0.0:
+        return x
+    return np.append(x[0], x[1:] - coeff * x[:-1])
 
 
 def compute_short_time_energy(
@@ -84,11 +104,16 @@ def _adaptive_threshold(feature: np.ndarray, ratio: float) -> float:
     """Estimate threshold using initial-noise statistics and global ratio."""
     if feature.size == 0:
         return 0.0
-    noise_frames = int(np.clip(np.ceil(0.1 * len(feature)), 5, 25))
-    noise_slice = feature[:noise_frames]
-    noise_mean = float(np.mean(noise_slice))
-    noise_std = float(np.std(noise_slice))
-    return max(ratio * float(np.max(feature)), noise_mean + 2.5 * noise_std)
+    head_frames = int(np.clip(np.ceil(NOISE_HEAD_FRACTION * len(feature)), 5, 25))
+    head_slice = feature[:head_frames]
+    low_frames = int(np.clip(np.ceil(NOISE_LOWEST_FRACTION * len(feature)), 5, len(feature)))
+    low_slice = np.sort(feature)[:low_frames]
+    noise_mean = min(float(np.mean(head_slice)), float(np.mean(low_slice)))
+    noise_std = min(float(np.std(head_slice)), float(np.std(low_slice)))
+    return max(
+        ratio * float(np.max(feature)),
+        noise_mean + ADAPTIVE_NOISE_STD_FACTOR * noise_std,
+    )
 
 
 def _smooth_mask(raw_mask: np.ndarray, hop_ms: float) -> np.ndarray:
@@ -237,9 +262,11 @@ def detect_segments_energy_zcr(
     zcr = compute_zero_crossing_rate(signal_samples, frame_size, hop_size)
     energy_th = _adaptive_threshold(energy, energy_threshold_ratio)
     zcr_th = _adaptive_threshold(zcr, zcr_threshold_ratio)
-    noise_frames = int(np.clip(np.ceil(0.1 * len(energy)), 5, 25))
+    noise_frames = int(np.clip(np.ceil(NOISE_HEAD_FRACTION * len(energy)), 5, 25))
     noise_slice = energy[:noise_frames]
-    noise_energy_floor = float(np.mean(noise_slice) + 2.0 * np.std(noise_slice))
+    noise_energy_floor = float(
+        np.mean(noise_slice) + ZCR_ENERGY_FLOOR_STD_FACTOR * np.std(noise_slice)
+    )
     mask = (energy > energy_th) | ((zcr > zcr_th) & (energy > noise_energy_floor))
     mask = _smooth_mask(mask, hop_ms)
     segments = _mask_to_segments(mask, hop_size, frame_size, len(signal_samples))
@@ -350,7 +377,7 @@ def compute_mfcc(
     num_ceps: int = DEFAULT_MEL_FILTERS,
     frame_ms: float = DEFAULT_FRAME_MS,
     hop_ms: float = DEFAULT_HOP_MS,
-    pre_emphasis: float = 0.0,
+    pre_emphasis: float = DEFAULT_PRE_EMPHASIS,
     n_fft: int = None,
     fmin: float = DEFAULT_MEL_FMIN_HZ,
     fmax: float = DEFAULT_MEL_FMAX_HZ,
@@ -359,11 +386,7 @@ def compute_mfcc(
     if signal_samples.size == 0:
         return np.empty((0, num_ceps))
 
-    emphasized = signal_samples.astype(float)
-    if pre_emphasis > 0:
-        emphasized = np.append(
-            emphasized[0], emphasized[1:] - pre_emphasis * emphasized[:-1]
-        )
+    emphasized = apply_pre_emphasis(signal_samples, pre_emphasis)
 
     frame_size = int(fs * frame_ms / 1000)
     hop_size = int(fs * hop_ms / 1000)
@@ -396,17 +419,19 @@ def compute_spectrogram(
     fs: int,
     frame_ms: float = DEFAULT_FRAME_MS,
     hop_ms: float = DEFAULT_HOP_MS,
+    pre_emphasis: float = DEFAULT_PRE_EMPHASIS,
 ) -> np.ndarray:
     """Compute magnitude spectrogram of a signal."""
     frame_size = int(fs * frame_ms / 1000)
     hop_size = int(fs * hop_ms / 1000)
-    if signal_samples.size < frame_size:
+    emphasized = apply_pre_emphasis(signal_samples, pre_emphasis)
+    if emphasized.size < frame_size:
         return np.empty((0, frame_size // 2 + 1))
 
     n = np.arange(frame_size)
     hamming = 0.54 - 0.46 * np.cos(np.pi * n / frame_size)
     _, _, zxx = signal.stft(
-        signal_samples,
+        emphasized,
         fs=fs,
         window=hamming,
         nperseg=frame_size,
@@ -423,14 +448,16 @@ def compute_bark_band_energies(
     fs: int,
     frame_ms: float = DEFAULT_FRAME_MS,
     hop_ms: float = DEFAULT_HOP_MS,
+    pre_emphasis: float = DEFAULT_PRE_EMPHASIS,
 ) -> np.ndarray:
     """Compute Bark-band energies (bands 1..16) per frame."""
     frame_size = int(fs * frame_ms / 1000)
     hop_size = int(fs * hop_ms / 1000)
-    if signal_samples.size < frame_size:
+    emphasized = apply_pre_emphasis(signal_samples, pre_emphasis)
+    if emphasized.size < frame_size:
         return np.empty((0, len(BARK_BAND_LIMITS_HZ)))
 
-    num_frames = 1 + (len(signal_samples) - frame_size) // hop_size
+    num_frames = 1 + (len(emphasized) - frame_size) // hop_size
     n = np.arange(frame_size)
     hamming = 0.54 - 0.46 * np.cos(np.pi * n / frame_size)
     fft_freqs = np.fft.rfftfreq(frame_size, d=1 / fs)
@@ -441,12 +468,184 @@ def compute_bark_band_energies(
     energies = np.zeros((num_frames, len(BARK_BAND_LIMITS_HZ)))
     for i in range(num_frames):
         start = i * hop_size
-        frame = signal_samples[start : start + frame_size].astype(float) * hamming
+        frame = emphasized[start : start + frame_size].astype(float) * hamming
         mag = np.abs(np.fft.rfft(frame))
         for b, bins in enumerate(band_bins):
             if bins.size > 0:
                 energies[i, b] = np.sum(mag[bins] ** 2)
     return energies
+
+
+def _frame_signal(
+    signal_samples: np.ndarray,
+    fs: int,
+    frame_ms: float,
+    hop_ms: float,
+    pre_emphasis: float,
+) -> Tuple[np.ndarray, int]:
+    """Frame a signal with Hamming windowing."""
+    frame_size = int(fs * frame_ms / 1000)
+    hop_size = int(fs * hop_ms / 1000)
+    emphasized = apply_pre_emphasis(signal_samples, pre_emphasis)
+    if emphasized.size < frame_size:
+        return np.empty((0, frame_size)), frame_size
+    num_frames = 1 + (len(emphasized) - frame_size) // hop_size
+    frames = np.stack([
+        emphasized[i * hop_size : i * hop_size + frame_size] for i in range(num_frames)
+    ])
+    n = np.arange(frame_size)
+    hamming = 0.54 - 0.46 * np.cos(np.pi * n / frame_size)
+    frames *= hamming
+    return frames, frame_size
+
+
+def compute_cepstrogram(
+    signal_samples: np.ndarray,
+    fs: int,
+    frame_ms: float = DEFAULT_FRAME_MS,
+    hop_ms: float = DEFAULT_HOP_MS,
+    pre_emphasis: float = DEFAULT_PRE_EMPHASIS,
+    n_fft: int = None,
+    max_quefrency_ms: float = 20.0,
+) -> np.ndarray:
+    """Compute frame-wise real cepstrum (cepstrogram)."""
+    frames, frame_size = _frame_signal(signal_samples, fs, frame_ms, hop_ms, pre_emphasis)
+    if frames.size == 0:
+        return np.empty((0, 0))
+    if n_fft is None:
+        n_fft = frame_size
+    mag = np.abs(np.fft.rfft(frames, n=n_fft))
+    log_mag = np.log(mag + 1e-12)
+    cep = np.fft.irfft(log_mag, n=n_fft, axis=1)
+    max_q = min(int(fs * max_quefrency_ms / 1000.0), cep.shape[1])
+    return cep[:, :max_q]
+
+
+def _levinson_durbin(r: np.ndarray, order: int) -> np.ndarray:
+    """Levinson-Durbin recursion returning LPC a[1..order]."""
+    a = np.zeros(order + 1)
+    e = float(r[0]) if r[0] > 1e-12 else 1e-12
+    a[0] = 1.0
+    for i in range(1, order + 1):
+        acc = 0.0
+        for j in range(1, i):
+            acc += a[j] * r[i - j]
+        k = (r[i] - acc) / e
+        a_prev = a.copy()
+        a[i] = k
+        for j in range(1, i):
+            a[j] = a_prev[j] - k * a_prev[i - j]
+        e *= max(1e-12, (1.0 - k * k))
+    return a[1:]
+
+
+def compute_lpc_features(
+    signal_samples: np.ndarray,
+    fs: int,
+    order: int = DEFAULT_LPC_ORDER,
+    frame_ms: float = DEFAULT_FRAME_MS,
+    hop_ms: float = DEFAULT_HOP_MS,
+    pre_emphasis: float = DEFAULT_PRE_EMPHASIS,
+) -> np.ndarray:
+    """Compute frame-wise LPC coefficient features."""
+    frames, frame_size = _frame_signal(signal_samples, fs, frame_ms, hop_ms, pre_emphasis)
+    if frames.size == 0:
+        return np.empty((0, order))
+    order = min(order, frame_size - 1)
+    feats = np.zeros((frames.shape[0], order))
+    for i, frame in enumerate(frames):
+        r = np.correlate(frame, frame, mode="full")
+        mid = len(r) // 2
+        ac = r[mid : mid + order + 1]
+        feats[i, :] = _levinson_durbin(ac, order)
+    return feats
+
+
+def compute_wavelet_features(
+    signal_samples: np.ndarray,
+    fs: int,
+    min_scale: int = DEFAULT_WAVELET_MIN_SCALE,
+    max_scale: int = DEFAULT_WAVELET_MAX_SCALE,
+    frame_ms: float = DEFAULT_FRAME_MS,
+    hop_ms: float = DEFAULT_HOP_MS,
+    pre_emphasis: float = DEFAULT_PRE_EMPHASIS,
+) -> np.ndarray:
+    """Compute frame-wise wavelet energy features over selected scales."""
+    frames, _ = _frame_signal(signal_samples, fs, frame_ms, hop_ms, pre_emphasis)
+    if frames.size == 0:
+        return np.empty((0, max(0, max_scale - min_scale + 1)))
+    min_scale = max(1, int(min_scale))
+    max_scale = max(min_scale, int(max_scale))
+    scales = np.arange(min_scale, max_scale + 1)
+    feats = np.zeros((frames.shape[0], len(scales)))
+
+    def ricker_wavelet(scale: int) -> np.ndarray:
+        # Width proportional to scale; odd length keeps symmetric center.
+        length = int(max(8 * scale + 1, 17))
+        if length % 2 == 0:
+            length += 1
+        t = np.arange(length) - (length // 2)
+        a = float(scale)
+        ts = (t / a) ** 2
+        wave = (1.0 - ts) * np.exp(-0.5 * ts)
+        # Normalize energy to keep scale energies comparable.
+        norm = np.sqrt(np.sum(wave ** 2)) + 1e-12
+        return wave / norm
+
+    for i, frame in enumerate(frames):
+        scale_energies = []
+        for scale in scales:
+            wave = ricker_wavelet(int(scale))
+            coeff = np.convolve(frame, wave, mode="same")
+            scale_energies.append(float(np.sum(coeff ** 2)))
+        feats[i, :] = np.log(np.array(scale_energies) + 1e-12)
+    return feats
+
+
+def synthesize_lpc_speech(
+    signal_samples: np.ndarray,
+    fs: int,
+    order: int = DEFAULT_LPC_ORDER,
+    frame_ms: float = DEFAULT_FRAME_MS,
+    hop_ms: float = DEFAULT_HOP_MS,
+    pre_emphasis: float = DEFAULT_PRE_EMPHASIS,
+) -> np.ndarray:
+    """Re-synthesize speech using frame-wise LPC analysis and overlap-add."""
+    frame_size = int(fs * frame_ms / 1000)
+    hop_size = int(fs * hop_ms / 1000)
+    emphasized = apply_pre_emphasis(signal_samples, pre_emphasis)
+    if emphasized.size < frame_size:
+        return np.array([], dtype=float)
+
+    num_frames = 1 + (len(emphasized) - frame_size) // hop_size
+    out_len = (num_frames - 1) * hop_size + frame_size
+    y_acc = np.zeros(out_len, dtype=float)
+    w_acc = np.zeros(out_len, dtype=float)
+    n = np.arange(frame_size)
+    win = 0.54 - 0.46 * np.cos(np.pi * n / frame_size)
+    order = min(order, frame_size - 1)
+
+    for i in range(num_frames):
+        start = i * hop_size
+        frame = emphasized[start : start + frame_size].astype(float) * win
+        r = np.correlate(frame, frame, mode="full")
+        mid = len(r) // 2
+        ac = r[mid : mid + order + 1]
+        a = _levinson_durbin(ac, order)
+
+        # Residual e[n] = x[n] - sum_k a_k x[n-k]
+        e = signal.lfilter(np.concatenate(([1.0], -a)), [1.0], frame)
+        # All-pole synthesis x_hat[n] = 1/A(z) * e[n], A(z)=1-sum_k a_k z^-k
+        y_frame = signal.lfilter([1.0], np.concatenate(([1.0], -a)), e)
+
+        y_acc[start : start + frame_size] += y_frame * win
+        w_acc[start : start + frame_size] += win ** 2
+
+    y = y_acc / (w_acc + 1e-12)
+    # De-emphasis inverse filter: y[n] = x[n] + a*y[n-1]
+    if pre_emphasis > 0:
+        y = signal.lfilter([1.0], [1.0, -pre_emphasis], y)
+    return y
 
 
 def dtw_distance(seq1: np.ndarray, seq2: np.ndarray) -> float:

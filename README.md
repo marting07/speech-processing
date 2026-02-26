@@ -6,12 +6,18 @@ Desktop app for recording speech, segmenting isolated words, extracting features
 
 - Record audio from microphone.
 - Segment speech with short-time methods (`energy`, `zcr`, `energy_zcr`, `entropy`).
-- Choose feature mode per operation: `mfcc` or `bark`.
+- Choose feature mode per operation: `mfcc`, `bark`, `lpc`, or `wavelet`.
+- Choose segment selection strategy: `manual` or `auto-best`.
 - Save labeled segments to a JSON dictionary.
 - Extract and store:
   - Spectrogram frames
-  - Either Bark-band energies (bands 1..16) or MFCC frames (based on selected feature mode)
-- Compare a new recording against dictionary entries using Dynamic Time Warping (DTW).
+  - One selected feature matrix (`mfcc`/`bark`/`lpc`/`wavelet`) per entry
+- Compare selected segmented utterances against dictionary entries using Dynamic Time Warping (DTW).
+- Visualize **Spectrogram** and **Cepstrogram** from recorded audio/segments.
+- Visualize **Wavelet Scalogram** (frame-scale energy diagram).
+- Run **LPC Speech Synthesis** (analyze/resynthesize) and playback.
+- Tune DSP parameters from UI (frame/hop, thresholds, pre-emphasis, LPC order, wavelet scales) with recommended ranges.
+- Apply ready presets: `Quiet Room`, `Noisy Room`, `Fast Speech`.
 
 ## Architecture
 
@@ -28,7 +34,10 @@ The current implementation is configured with:
 - Frame size: `30 ms`
 - Hop size: `10 ms`
 - Window: `Hamming`
+- Pre-emphasis: `0.97`
 - MFCC: `15` Mel filters/coefficients, `fmin=80 Hz`, `fmax=4000 Hz`
+- LPC order: `12` (common recommendation for `8 kHz`)
+- Wavelet scales: `6..24`
 
 ## Requirements
 
@@ -47,11 +56,23 @@ python3 speech_recognition_app.py
 ## Basic Workflow
 
 1. Click **Record**.
-2. Click **Segment** (select method if needed).
+2. Click **Segment** (select segmentation method if needed).
 3. Use **Clear Segments** to remove segmentation markers and re-run if needed.
-4. Choose **Features** (`mfcc` or `bark`), then click **Save Segment** and enter a label.
-5. Repeat to build dictionary entries.
-6. Use the same **Features** mode and click **Compare** to recognize a new utterance.
+4. Optionally inspect **Show Spectrogram** / **Show Cepstrogram**.
+5. Optionally inspect **Show Wavelet**.
+6. Optionally run **Synthesize LPC** then **Play LPC**.
+7. Choose **Features** (`mfcc`/`bark`/`lpc`/`wavelet`) and **Segment pick** (`manual` or `auto-best`), then click **Save Segment** and enter a label.
+8. Repeat to build dictionary entries.
+9. Use the same **Features** mode and click **Compare** to match a segment against dictionary entries.
+
+## Recommended Ranges (UI Labels)
+
+- Frame length: `20-40 ms` (default `30`)
+- Hop length: `5-15 ms` (default `10`)
+- Pre-emphasis: `0.95-0.98` (default `0.97`)
+- Energy/ZCR/Entropy threshold ratios: `0.05-0.20`
+- LPC order at `8 kHz`: `10-14` (default `12`)
+- Wavelet scales: `6-24`
 
 ## Dictionary File
 
@@ -61,4 +82,4 @@ The app writes `speech_dictionary.json` in the project root.
 - New saves append entries.
 - Recognition supports current entries and older legacy MFCC-only entries.
 
-Each entry stores metadata, `feature_type`, spectrogram, and the selected feature matrix.
+Each entry stores metadata, `feature_type`, spectrogram, selected feature matrix, and extraction settings (including pre-emphasis).
