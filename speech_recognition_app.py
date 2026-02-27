@@ -68,6 +68,8 @@ from speech_dsp import (
     DEFAULT_LPC_ORDER,
     DEFAULT_WAVELET_MIN_SCALE,
     DEFAULT_WAVELET_MAX_SCALE,
+    ONSET_PREROLL_MS,
+    FRICATIVE_BAND_LOW_HZ,
     apply_pre_emphasis,
     compute_bark_band_energies,
     compute_cepstrogram,
@@ -320,6 +322,25 @@ class SpeechRecognitionApp(QMainWindow):
         self.entropy_th_spin.setValue(0.10)
         params_layout.addWidget(self.entropy_th_spin, row, 1)
         params_layout.addWidget(QLabel("Rec: 0.05-0.20"), row, 2)
+        row += 1
+
+        params_layout.addWidget(QLabel("Onset pre-roll ms"), row, 0)
+        self.onset_preroll_spin = QDoubleSpinBox()
+        self.onset_preroll_spin.setRange(0.0, 200.0)
+        self.onset_preroll_spin.setDecimals(0)
+        self.onset_preroll_spin.setSingleStep(5.0)
+        self.onset_preroll_spin.setValue(ONSET_PREROLL_MS)
+        params_layout.addWidget(self.onset_preroll_spin, row, 1)
+        params_layout.addWidget(QLabel("Rec: 30-80 (50 default)"), row, 2)
+        row += 1
+
+        params_layout.addWidget(QLabel("Fricative band low Hz"), row, 0)
+        self.fricative_band_low_spin = QSpinBox()
+        self.fricative_band_low_spin.setRange(600, 3500)
+        self.fricative_band_low_spin.setSingleStep(100)
+        self.fricative_band_low_spin.setValue(int(FRICATIVE_BAND_LOW_HZ))
+        params_layout.addWidget(self.fricative_band_low_spin, row, 1)
+        params_layout.addWidget(QLabel("Rec @8kHz: 1400-2400 (1800 default)"), row, 2)
         row += 1
 
         params_layout.addWidget(QLabel("LPC order"), row, 0)
@@ -581,6 +602,8 @@ class SpeechRecognitionApp(QMainWindow):
             "energy_th": float(self.energy_th_spin.value()),
             "zcr_th": float(self.zcr_th_spin.value()),
             "entropy_th": float(self.entropy_th_spin.value()),
+            "onset_preroll_ms": float(self.onset_preroll_spin.value()),
+            "fricative_band_low_hz": float(self.fricative_band_low_spin.value()),
             "lpc_order": int(self.lpc_order_spin.value()),
             "wav_min": int(self.wavelet_min_scale_spin.value()),
             "wav_max": int(self.wavelet_max_scale_spin.value()),
@@ -599,6 +622,8 @@ class SpeechRecognitionApp(QMainWindow):
             self.energy_th_spin.setValue(0.10)
             self.zcr_th_spin.setValue(0.10)
             self.entropy_th_spin.setValue(0.10)
+            self.onset_preroll_spin.setValue(50.0)
+            self.fricative_band_low_spin.setValue(1800)
             self.lpc_order_spin.setValue(12)
             self.wavelet_min_scale_spin.setValue(6)
             self.wavelet_max_scale_spin.setValue(24)
@@ -612,6 +637,8 @@ class SpeechRecognitionApp(QMainWindow):
             self.energy_th_spin.setValue(0.14)
             self.zcr_th_spin.setValue(0.14)
             self.entropy_th_spin.setValue(0.14)
+            self.onset_preroll_spin.setValue(65.0)
+            self.fricative_band_low_spin.setValue(1600)
             self.lpc_order_spin.setValue(12)
             self.wavelet_min_scale_spin.setValue(8)
             self.wavelet_max_scale_spin.setValue(28)
@@ -625,6 +652,8 @@ class SpeechRecognitionApp(QMainWindow):
             self.energy_th_spin.setValue(0.10)
             self.zcr_th_spin.setValue(0.10)
             self.entropy_th_spin.setValue(0.10)
+            self.onset_preroll_spin.setValue(40.0)
+            self.fricative_band_low_spin.setValue(2000)
             self.lpc_order_spin.setValue(12)
             self.wavelet_min_scale_spin.setValue(6)
             self.wavelet_max_scale_spin.setValue(22)
@@ -994,6 +1023,8 @@ class SpeechRecognitionApp(QMainWindow):
                 energy_threshold_ratio=params["energy_th"],
                 zcr_threshold_ratio=params["zcr_th"],
                 entropy_threshold_ratio=params["entropy_th"],
+                onset_preroll_ms=params["onset_preroll_ms"],
+                fricative_band_low_hz=params["fricative_band_low_hz"],
             )
             if not self.segments:
                 QMessageBox.information(self, "Segmentation", "No segments detected.")

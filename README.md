@@ -9,6 +9,8 @@ Desktop app for recording speech, segmenting isolated words, extracting features
   - `Kalman Speech Following`
 - Record audio from microphone.
 - Segment speech with short-time methods (`energy`, `zcr`, `energy_zcr`, `entropy`).
+- Segmentation uses adaptive robust thresholds + feature smoothing + hysteresis/hangover + post-merge/min-duration cleanup.
+- Fricative onsets are handled with high-band energy cues plus onset pre-roll to better keep starts like Spanish `s` (`seis`, `siete`).
 - Choose feature mode per operation: `mfcc`, `bark`, `lpc`, or `wavelet`.
 - Choose segment selection strategy: `manual` or `auto-best`.
 - Save labeled segments to a JSON dictionary.
@@ -96,6 +98,8 @@ python3 speech_recognition_app.py
 - Hop length: `5-15 ms` (default `10`)
 - Pre-emphasis: `0.95-0.98` (default `0.97`)
 - Energy/ZCR/Entropy threshold ratios: `0.05-0.20`
+- Onset pre-roll: `30-80 ms` (default `50 ms`)
+- Fricative band low cutoff at `8 kHz`: `1400-2400 Hz` (default `1800 Hz`)
 - LPC order at `8 kHz`: `10-14` (default `12`)
 - Wavelet scales: `6-24`
 - HMM states: `4-8`
