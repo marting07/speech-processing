@@ -23,6 +23,14 @@ ADAPTIVE_NOISE_STD_FACTOR = 2.8
 NOISE_HEAD_FRACTION = 0.10
 NOISE_LOWEST_FRACTION = 0.20
 ZCR_ENERGY_FLOOR_STD_FACTOR = 2.5
+HYSTERESIS_MARGIN = 0.20
+HANGOVER_MS = 120.0
+SMOOTH_MS = 35.0
+MIN_RUN_MS = 50.0
+ONSET_PREROLL_MS = 50.0
+FRICATIVE_BAND_LOW_HZ = 1800.0
+POST_MERGE_GAP_MS = 150.0
+POST_MIN_SEGMENT_MS = 120.0
 
 # Bark critical bands 1..16 from the notes (band 0 is excluded).
 BARK_BAND_LIMITS_HZ = [
@@ -68,6 +76,51 @@ def compute_short_time_energy(
     return energy
 
 
+def compute_energy_trajectory(
+    signal_samples: np.ndarray,
+    fs: int,
+    frame_ms: float = DEFAULT_FRAME_MS,
+    hop_ms: float = DEFAULT_HOP_MS,
+    pre_emphasis: float = DEFAULT_PRE_EMPHASIS,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute normalized short-time energy trajectory and time axis."""
+    frame_size = int(fs * frame_ms / 1000)
+    hop_size = int(fs * hop_ms / 1000)
+    emphasized = apply_pre_emphasis(signal_samples, pre_emphasis)
+    if emphasized.size < frame_size:
+        return np.array([]), np.array([])
+    energy = compute_short_time_energy(emphasized, frame_size, hop_size)
+    energy = energy / (np.max(energy) + 1e-12)
+    times = (np.arange(len(energy)) * hop_size + frame_size / 2) / fs
+    return times, energy
+
+
+def kalman_filter_1d(
+    measurements: np.ndarray,
+    process_var: float = 1e-4,
+    measurement_var: float = 1e-2,
+    init_state: float = None,
+    init_var: float = 1.0,
+) -> np.ndarray:
+    """Apply scalar Kalman filter to a 1-D measurement sequence."""
+    if measurements.size == 0:
+        return np.array([])
+    q = max(process_var, 1e-12)
+    r = max(measurement_var, 1e-12)
+    x = float(measurements[0] if init_state is None else init_state)
+    p = max(init_var, 1e-12)
+    out = np.zeros_like(measurements, dtype=float)
+    for i, z in enumerate(measurements):
+        # Predict
+        p = p + q
+        # Update
+        k = p / (p + r)
+        x = x + k * (float(z) - x)
+        p = (1.0 - k) * p
+        out[i] = x
+    return out
+
+
 def compute_zero_crossing_rate(
     signal_samples: np.ndarray, frame_size: int, hop_size: int
 ) -> np.ndarray:
@@ -100,61 +153,157 @@ def compute_spectral_entropy(
     return entropy
 
 
-def _adaptive_threshold(feature: np.ndarray, ratio: float) -> float:
-    """Estimate threshold using initial-noise statistics and global ratio."""
+def compute_high_band_energy_ratio(
+    signal_samples: np.ndarray,
+    frame_size: int,
+    hop_size: int,
+    fs: int,
+    low_hz: float = FRICATIVE_BAND_LOW_HZ,
+) -> np.ndarray:
+    """Compute high-frequency energy ratio per frame (useful for fricatives)."""
+    num_frames = 1 + (len(signal_samples) - frame_size) // hop_size
+    ratios = np.zeros(num_frames, dtype=float)
+    window = np.hamming(frame_size)
+    freqs = np.fft.rfftfreq(frame_size, d=1.0 / fs)
+    high_bins = freqs >= low_hz
+    for i in range(num_frames):
+        start = i * hop_size
+        frame = signal_samples[start : start + frame_size].astype(float) * window
+        power = np.abs(np.fft.rfft(frame)) ** 2
+        total = float(np.sum(power))
+        if total <= 1e-12:
+            ratios[i] = 0.0
+        else:
+            ratios[i] = float(np.sum(power[high_bins]) / total)
+    return ratios
+
+
+def _moving_average(feature: np.ndarray, window_frames: int) -> np.ndarray:
+    """Apply simple moving-average smoothing to frame features."""
+    if feature.size == 0 or window_frames <= 1:
+        return feature.astype(float)
+    kernel = np.ones(window_frames, dtype=float) / float(window_frames)
+    return np.convolve(feature.astype(float), kernel, mode="same")
+
+
+def _feature_noise_stats(feature: np.ndarray) -> Tuple[float, float]:
+    """Robust noise-floor estimate from head and low-valued frames."""
     if feature.size == 0:
-        return 0.0
+        return 0.0, 0.0
     head_frames = int(np.clip(np.ceil(NOISE_HEAD_FRACTION * len(feature)), 5, 25))
     head_slice = feature[:head_frames]
     low_frames = int(np.clip(np.ceil(NOISE_LOWEST_FRACTION * len(feature)), 5, len(feature)))
     low_slice = np.sort(feature)[:low_frames]
-    noise_mean = min(float(np.mean(head_slice)), float(np.mean(low_slice)))
-    noise_std = min(float(np.std(head_slice)), float(np.std(low_slice)))
+    noise_mean_head = float(np.mean(head_slice))
+    noise_mean_low = float(np.mean(low_slice))
+    noise_std_head = float(np.std(head_slice))
+    noise_std_low = float(np.std(low_slice))
+    noise_mean = min(noise_mean_head, noise_mean_low)
+    noise_std = min(noise_std_head, noise_std_low)
+    # MAD-based robustness for outlier frames.
+    median_low = float(np.median(low_slice))
+    mad_low = float(np.median(np.abs(low_slice - median_low)))
+    robust_std = 1.4826 * mad_low
+    noise_std = max(noise_std, robust_std)
+    return noise_mean, noise_std
+
+
+def _adaptive_threshold(feature: np.ndarray, ratio: float) -> float:
+    """Estimate threshold using robust noise statistics and global ratio."""
+    if feature.size == 0:
+        return 0.0
+    noise_mean, noise_std = _feature_noise_stats(feature)
     return max(
         ratio * float(np.max(feature)),
         noise_mean + ADAPTIVE_NOISE_STD_FACTOR * noise_std,
     )
 
 
-def _smooth_mask(raw_mask: np.ndarray, hop_ms: float) -> np.ndarray:
-    """Fill short gaps and suppress very short speech islands."""
-    mask = raw_mask.astype(bool).copy()
-    # Allow short unvoiced/closure intervals inside a single word.
-    max_gap_frames = max(1, int(round(120.0 / hop_ms)))  # ~120 ms
-    min_run_frames = max(1, int(round(40.0 / hop_ms)))   # ~40 ms
-
-    idx = 0
-    while idx < len(mask):
-        if mask[idx]:
-            idx += 1
+def _hysteresis_mask(
+    on_condition: np.ndarray,
+    off_condition: np.ndarray,
+    hangover_frames: int,
+    min_run_frames: int,
+) -> np.ndarray:
+    """Create stable speech mask using hysteresis and hangover."""
+    n = len(on_condition)
+    mask = np.zeros(n, dtype=bool)
+    active = False
+    hold = 0
+    run_start = -1
+    for i in range(n):
+        if not active:
+            if on_condition[i]:
+                active = True
+                hold = hangover_frames
+                run_start = i
+                mask[i] = True
             continue
-        gap_start = idx
-        while idx < len(mask) and not mask[idx]:
-            idx += 1
-        gap_end = idx
-        gap_len = gap_end - gap_start
-        left_speech = gap_start > 0 and mask[gap_start - 1]
-        right_speech = gap_end < len(mask) and mask[gap_end]
-        if left_speech and right_speech and gap_len <= max_gap_frames:
-            mask[gap_start:gap_end] = True
 
-    idx = 0
-    while idx < len(mask):
-        if not mask[idx]:
-            idx += 1
-            continue
-        run_start = idx
-        while idx < len(mask) and mask[idx]:
-            idx += 1
-        run_end = idx
-        if (run_end - run_start) < min_run_frames:
-            mask[run_start:run_end] = False
+        mask[i] = True
+        if off_condition[i]:
+            hold -= 1
+            if hold <= 0:
+                active = False
+                run_len = i - run_start + 1
+                if run_len < min_run_frames:
+                    mask[run_start : i + 1] = False
+                run_start = -1
+        else:
+            hold = hangover_frames
 
+    if active and run_start >= 0:
+        run_len = n - run_start
+        if run_len < min_run_frames:
+            mask[run_start:] = False
     return mask
 
 
+def _feature_hysteresis_mask(
+    feature: np.ndarray,
+    threshold_ratio: float,
+    hop_ms: float,
+    polarity: str = "high",
+) -> np.ndarray:
+    """Build speech mask from one feature with smoothing+hysteresis."""
+    if feature.size == 0:
+        return np.zeros(0, dtype=bool)
+    smooth_frames = max(1, int(round(SMOOTH_MS / max(hop_ms, 1e-6))))
+    feat_s = _moving_average(feature, smooth_frames)
+    noise_mean, noise_std = _feature_noise_stats(feat_s)
+    base_th = _adaptive_threshold(feat_s, threshold_ratio)
+    hangover_frames = max(1, int(round(HANGOVER_MS / max(hop_ms, 1e-6))))
+    min_run_frames = max(1, int(round(MIN_RUN_MS / max(hop_ms, 1e-6))))
+
+    if polarity == "high":
+        onset_th = max(base_th, noise_mean + ADAPTIVE_NOISE_STD_FACTOR * noise_std)
+        offset_th = max(
+            noise_mean + 0.6 * ADAPTIVE_NOISE_STD_FACTOR * noise_std,
+            onset_th * (1.0 - HYSTERESIS_MARGIN),
+        )
+        on_condition = feat_s >= onset_th
+        off_condition = feat_s < offset_th
+    elif polarity == "low":
+        # For features where speech reduces value (e.g., some entropy setups).
+        onset_th = min(base_th, noise_mean - ADAPTIVE_NOISE_STD_FACTOR * noise_std)
+        offset_th = min(
+            noise_mean - 0.6 * ADAPTIVE_NOISE_STD_FACTOR * noise_std,
+            onset_th * (1.0 + HYSTERESIS_MARGIN),
+        )
+        on_condition = feat_s <= onset_th
+        off_condition = feat_s > offset_th
+    else:
+        raise ValueError(f"Unknown polarity: {polarity}")
+
+    return _hysteresis_mask(on_condition, off_condition, hangover_frames, min_run_frames)
+
+
 def _mask_to_segments(
-    mask: np.ndarray, hop_size: int, frame_size: int, signal_len: int
+    mask: np.ndarray,
+    hop_size: int,
+    frame_size: int,
+    signal_len: int,
+    onset_preroll_samples: int = 0,
 ) -> List[Tuple[int, int]]:
     """Convert a boolean speech mask into sample-index segments."""
     segments: List[Tuple[int, int]] = []
@@ -167,11 +316,11 @@ def _mask_to_segments(
         elif not is_speech and in_seg:
             in_seg = False
             end_frame = idx
-            start_sample = start_frame * hop_size
+            start_sample = max(0, start_frame * hop_size - onset_preroll_samples)
             end_sample = min(signal_len, end_frame * hop_size + frame_size)
             segments.append((start_sample, end_sample))
     if in_seg:
-        start_sample = start_frame * hop_size
+        start_sample = max(0, start_frame * hop_size - onset_preroll_samples)
         end_sample = signal_len
         segments.append((start_sample, end_sample))
     return segments
@@ -180,8 +329,8 @@ def _mask_to_segments(
 def _postprocess_segments(
     segments: List[Tuple[int, int]],
     fs: int,
-    merge_gap_ms: float = 150.0,
-    min_segment_ms: float = 120.0,
+    merge_gap_ms: float = POST_MERGE_GAP_MS,
+    min_segment_ms: float = POST_MIN_SEGMENT_MS,
 ) -> List[Tuple[int, int]]:
     """Merge close segments and remove very short artifacts."""
     if not segments:
@@ -213,16 +362,19 @@ def detect_segments_energy(
     frame_ms: float = DEFAULT_FRAME_MS,
     hop_ms: float = DEFAULT_HOP_MS,
     energy_threshold_ratio: float = 0.1,
+    onset_preroll_ms: float = ONSET_PREROLL_MS,
 ) -> List[Tuple[int, int]]:
     """Detect speech segments using short-time energy."""
     frame_size = int(fs * frame_ms / 1000)
     hop_size = int(fs * hop_ms / 1000)
+    onset_preroll_samples = int(fs * onset_preroll_ms / 1000.0)
     if len(signal_samples) < frame_size:
         return []
     energy = compute_short_time_energy(signal_samples, frame_size, hop_size)
-    threshold = _adaptive_threshold(energy, energy_threshold_ratio)
-    mask = _smooth_mask(energy > threshold, hop_ms)
-    segments = _mask_to_segments(mask, hop_size, frame_size, len(signal_samples))
+    mask = _feature_hysteresis_mask(energy, energy_threshold_ratio, hop_ms, polarity="high")
+    segments = _mask_to_segments(
+        mask, hop_size, frame_size, len(signal_samples), onset_preroll_samples=onset_preroll_samples
+    )
     return _postprocess_segments(segments, fs)
 
 
@@ -232,16 +384,36 @@ def detect_segments_zcr(
     frame_ms: float = DEFAULT_FRAME_MS,
     hop_ms: float = DEFAULT_HOP_MS,
     zcr_threshold_ratio: float = 0.1,
+    onset_preroll_ms: float = ONSET_PREROLL_MS,
+    fricative_band_low_hz: float = FRICATIVE_BAND_LOW_HZ,
 ) -> List[Tuple[int, int]]:
     """Detect speech segments using short-time zero crossing rate."""
     frame_size = int(fs * frame_ms / 1000)
     hop_size = int(fs * hop_ms / 1000)
+    onset_preroll_samples = int(fs * onset_preroll_ms / 1000.0)
     if len(signal_samples) < frame_size:
         return []
     zcr = compute_zero_crossing_rate(signal_samples, frame_size, hop_size)
-    threshold = _adaptive_threshold(zcr, zcr_threshold_ratio)
-    mask = _smooth_mask(zcr > threshold, hop_ms)
-    segments = _mask_to_segments(mask, hop_size, frame_size, len(signal_samples))
+    energy = compute_short_time_energy(signal_samples, frame_size, hop_size)
+    hf_ratio = compute_high_band_energy_ratio(
+        signal_samples, frame_size, hop_size, fs, low_hz=fricative_band_low_hz
+    )
+    smooth_frames = max(1, int(round(SMOOTH_MS / max(hop_ms, 1e-6))))
+    energy_s = _moving_average(energy, smooth_frames)
+    noise_mean_e, noise_std_e = _feature_noise_stats(energy_s)
+    energy_gate_th = max(
+        noise_mean_e + 0.5 * ADAPTIVE_NOISE_STD_FACTOR * noise_std_e,
+        0.04 * float(np.max(energy_s) + 1e-12),
+    )
+    energy_gate = energy_s >= energy_gate_th
+    mask_zcr = _feature_hysteresis_mask(zcr, zcr_threshold_ratio, hop_ms, polarity="high")
+    mask_hf = _feature_hysteresis_mask(
+        hf_ratio, max(0.05, 0.8 * zcr_threshold_ratio), hop_ms, polarity="high"
+    )
+    mask = (mask_zcr | mask_hf) & energy_gate
+    segments = _mask_to_segments(
+        mask, hop_size, frame_size, len(signal_samples), onset_preroll_samples=onset_preroll_samples
+    )
     return _postprocess_segments(segments, fs)
 
 
@@ -252,24 +424,46 @@ def detect_segments_energy_zcr(
     hop_ms: float = DEFAULT_HOP_MS,
     energy_threshold_ratio: float = 0.1,
     zcr_threshold_ratio: float = 0.1,
+    onset_preroll_ms: float = ONSET_PREROLL_MS,
+    fricative_band_low_hz: float = FRICATIVE_BAND_LOW_HZ,
 ) -> List[Tuple[int, int]]:
     """Detect speech segments using combined energy/ZCR criterion."""
     frame_size = int(fs * frame_ms / 1000)
     hop_size = int(fs * hop_ms / 1000)
+    onset_preroll_samples = int(fs * onset_preroll_ms / 1000.0)
     if len(signal_samples) < frame_size:
         return []
     energy = compute_short_time_energy(signal_samples, frame_size, hop_size)
     zcr = compute_zero_crossing_rate(signal_samples, frame_size, hop_size)
-    energy_th = _adaptive_threshold(energy, energy_threshold_ratio)
-    zcr_th = _adaptive_threshold(zcr, zcr_threshold_ratio)
+    hf_ratio = compute_high_band_energy_ratio(
+        signal_samples, frame_size, hop_size, fs, low_hz=fricative_band_low_hz
+    )
+    smooth_frames = max(1, int(round(SMOOTH_MS / max(hop_ms, 1e-6))))
+    energy_s = _moving_average(energy, smooth_frames)
+    zcr_s = _moving_average(zcr, smooth_frames)
+    hf_s = _moving_average(hf_ratio, smooth_frames)
+    energy_th = _adaptive_threshold(energy_s, energy_threshold_ratio)
+    zcr_th = _adaptive_threshold(zcr_s, zcr_threshold_ratio)
+    hf_th = _adaptive_threshold(hf_s, max(0.05, 0.8 * zcr_threshold_ratio))
     noise_frames = int(np.clip(np.ceil(NOISE_HEAD_FRACTION * len(energy)), 5, 25))
-    noise_slice = energy[:noise_frames]
+    noise_slice = energy_s[:noise_frames]
     noise_energy_floor = float(
         np.mean(noise_slice) + ZCR_ENERGY_FLOOR_STD_FACTOR * np.std(noise_slice)
     )
-    mask = (energy > energy_th) | ((zcr > zcr_th) & (energy > noise_energy_floor))
-    mask = _smooth_mask(mask, hop_ms)
-    segments = _mask_to_segments(mask, hop_size, frame_size, len(signal_samples))
+    energy_on = energy_s >= energy_th
+    energy_off = energy_s < max(noise_energy_floor, energy_th * (1.0 - HYSTERESIS_MARGIN))
+    zcr_on = zcr_s >= zcr_th
+    zcr_off = zcr_s < zcr_th * (1.0 - HYSTERESIS_MARGIN)
+    hf_on = hf_s >= hf_th
+    fricative_on = zcr_on & hf_on & (energy_s >= 0.5 * noise_energy_floor)
+    on_condition = energy_on | (zcr_on & (energy_s >= noise_energy_floor)) | fricative_on
+    off_condition = energy_off & zcr_off
+    hangover_frames = max(1, int(round(HANGOVER_MS / max(hop_ms, 1e-6))))
+    min_run_frames = max(1, int(round(MIN_RUN_MS / max(hop_ms, 1e-6))))
+    mask = _hysteresis_mask(on_condition, off_condition, hangover_frames, min_run_frames)
+    segments = _mask_to_segments(
+        mask, hop_size, frame_size, len(signal_samples), onset_preroll_samples=onset_preroll_samples
+    )
     return _postprocess_segments(segments, fs)
 
 
@@ -279,16 +473,32 @@ def detect_segments_entropy(
     frame_ms: float = DEFAULT_FRAME_MS,
     hop_ms: float = DEFAULT_HOP_MS,
     entropy_threshold_ratio: float = 0.1,
+    onset_preroll_ms: float = ONSET_PREROLL_MS,
 ) -> List[Tuple[int, int]]:
     """Detect speech segments using spectral entropy."""
     frame_size = int(fs * frame_ms / 1000)
     hop_size = int(fs * hop_ms / 1000)
+    onset_preroll_samples = int(fs * onset_preroll_ms / 1000.0)
     if len(signal_samples) < frame_size:
         return []
     entropy = compute_spectral_entropy(signal_samples, frame_size, hop_size)
-    threshold = _adaptive_threshold(entropy, entropy_threshold_ratio)
-    mask = _smooth_mask(entropy > threshold, hop_ms)
-    segments = _mask_to_segments(mask, hop_size, frame_size, len(signal_samples))
+    energy = compute_short_time_energy(signal_samples, frame_size, hop_size)
+    smooth_frames = max(1, int(round(SMOOTH_MS / max(hop_ms, 1e-6))))
+    energy_s = _moving_average(energy, smooth_frames)
+    noise_mean_e, noise_std_e = _feature_noise_stats(energy_s)
+    energy_gate_th = max(
+        noise_mean_e + 0.8 * ADAPTIVE_NOISE_STD_FACTOR * noise_std_e,
+        0.04 * float(np.max(energy_s) + 1e-12),
+    )
+    energy_gate = energy_s >= energy_gate_th
+    mask_high = _feature_hysteresis_mask(entropy, entropy_threshold_ratio, hop_ms, polarity="high")
+    mask_low = _feature_hysteresis_mask(entropy, entropy_threshold_ratio, hop_ms, polarity="low")
+    cand_high = mask_high & energy_gate
+    cand_low = mask_low & energy_gate
+    mask = cand_high if np.count_nonzero(cand_high) >= np.count_nonzero(cand_low) else cand_low
+    segments = _mask_to_segments(
+        mask, hop_size, frame_size, len(signal_samples), onset_preroll_samples=onset_preroll_samples
+    )
     return _postprocess_segments(segments, fs)
 
 
@@ -301,6 +511,8 @@ def detect_segments(
     energy_threshold_ratio: float = 0.1,
     zcr_threshold_ratio: float = 0.1,
     entropy_threshold_ratio: float = 0.1,
+    onset_preroll_ms: float = ONSET_PREROLL_MS,
+    fricative_band_low_hz: float = FRICATIVE_BAND_LOW_HZ,
 ) -> List[Tuple[int, int]]:
     """Detect speech segments based on the chosen method."""
     if method == "energy":
@@ -310,6 +522,7 @@ def detect_segments(
             frame_ms=frame_ms,
             hop_ms=hop_ms,
             energy_threshold_ratio=energy_threshold_ratio,
+            onset_preroll_ms=onset_preroll_ms,
         )
     if method == "zcr":
         return detect_segments_zcr(
@@ -318,6 +531,8 @@ def detect_segments(
             frame_ms=frame_ms,
             hop_ms=hop_ms,
             zcr_threshold_ratio=zcr_threshold_ratio,
+            onset_preroll_ms=onset_preroll_ms,
+            fricative_band_low_hz=fricative_band_low_hz,
         )
     if method == "energy_zcr":
         return detect_segments_energy_zcr(
@@ -327,6 +542,8 @@ def detect_segments(
             hop_ms=hop_ms,
             energy_threshold_ratio=energy_threshold_ratio,
             zcr_threshold_ratio=zcr_threshold_ratio,
+            onset_preroll_ms=onset_preroll_ms,
+            fricative_band_low_hz=fricative_band_low_hz,
         )
     if method == "entropy":
         return detect_segments_entropy(
@@ -335,6 +552,7 @@ def detect_segments(
             frame_ms=frame_ms,
             hop_ms=hop_ms,
             entropy_threshold_ratio=entropy_threshold_ratio,
+            onset_preroll_ms=onset_preroll_ms,
         )
     raise ValueError(f"Unknown segmentation method: {method}")
 

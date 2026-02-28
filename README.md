@@ -4,8 +4,13 @@ Desktop app for recording speech, segmenting isolated words, extracting features
 
 ## Features
 
+- Mode menu to switch between:
+  - `Speech Recognition`
+  - `Kalman Speech Following`
 - Record audio from microphone.
 - Segment speech with short-time methods (`energy`, `zcr`, `energy_zcr`, `entropy`).
+- Segmentation uses adaptive robust thresholds + feature smoothing + hysteresis/hangover + post-merge/min-duration cleanup.
+- Fricative onsets are handled with high-band energy cues plus onset pre-roll to better keep starts like Spanish `s` (`seis`, `siete`).
 - Choose feature mode per operation: `mfcc`, `bark`, `lpc`, or `wavelet`.
 - Choose segment selection strategy: `manual` or `auto-best`.
 - Save labeled segments to a JSON dictionary.
@@ -20,6 +25,7 @@ Desktop app for recording speech, segmenting isolated words, extracting features
 - Visualize **Spectrogram** and **Cepstrogram** from recorded audio/segments.
 - Visualize **Wavelet Scalogram** (frame-scale energy diagram).
 - Run **LPC Speech Synthesis** (analyze/resynthesize) and playback.
+- Run **Kalman speech-following demo** (short-time energy tracking).
 - Tune DSP parameters from UI (frame/hop, thresholds, pre-emphasis, LPC order, wavelet scales) with recommended ranges.
 - Apply ready presets: `Quiet Room`, `Noisy Room`, `Fast Speech`.
 
@@ -74,12 +80,26 @@ python3 speech_recognition_app.py
 9. Select **Recognition backend** (`dtw`, `hmm-discrete`, `hmm-continuous`).
 10. Use the same **Features** mode and click **Compare** to match a segment against dictionary entries.
 
+## Kalman Following Mode
+
+1. Open menu **Mode → Kalman Speech Following**.
+2. Choose source (`auto-best segment`, `manual segment`, or `whole recording`).
+3. Set Kalman parameters:
+   - Process noise `Q` (recommended `1e-5` to `1e-2`)
+   - Measurement noise `R` (recommended `1e-3` to `1e-1`)
+4. Click **Run Kalman Demo** for offline analysis of selected audio.
+5. Or click **Start Live** to track microphone energy in real time, then **Stop Live**.
+6. In live mode, confidence is shown as a percentage based on the rolling innovation stability.
+7. Optional: **Play Source**.
+
 ## Recommended Ranges (UI Labels)
 
 - Frame length: `20-40 ms` (default `30`)
 - Hop length: `5-15 ms` (default `10`)
 - Pre-emphasis: `0.95-0.98` (default `0.97`)
 - Energy/ZCR/Entropy threshold ratios: `0.05-0.20`
+- Onset pre-roll: `30-80 ms` (default `50 ms`)
+- Fricative band low cutoff at `8 kHz`: `1400-2400 Hz` (default `1800 Hz`)
 - LPC order at `8 kHz`: `10-14` (default `12`)
 - Wavelet scales: `6-24`
 - HMM states: `4-8`

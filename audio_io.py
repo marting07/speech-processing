@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import queue
 import numpy as np
 
 try:
@@ -41,3 +42,60 @@ def play_audio(samples: np.ndarray, fs: int, blocking: bool = False) -> None:
     if sd is None:
         raise AudioIOError("sounddevice is not installed")
     sd.play(samples, samplerate=fs, blocking=blocking)
+
+
+class RealtimeAudioStream:
+    """Microphone stream wrapper with chunk queue for real-time processing."""
+
+    def __init__(self, fs: int, blocksize: int = 256):
+        if sd is None:
+            raise AudioIOError("sounddevice is not installed")
+        self.fs = fs
+        self.blocksize = blocksize
+        self._queue: queue.Queue[np.ndarray] = queue.Queue()
+        self._stream = None
+
+    def _callback(self, indata, frames, time, status):
+        if status:
+            return
+        self._queue.put(indata[:, 0].copy())
+
+    def start(self) -> None:
+        """Start microphone streaming."""
+        if self._stream is not None:
+            return
+        self._stream = sd.InputStream(
+            samplerate=self.fs,
+            channels=1,
+            dtype=np.float32,
+            blocksize=self.blocksize,
+            callback=self._callback,
+        )
+        self._stream.start()
+
+    def stop(self) -> None:
+        """Stop microphone streaming and release resources."""
+        if self._stream is None:
+            return
+        self._stream.stop()
+        self._stream.close()
+        self._stream = None
+        self.clear()
+
+    def read_chunks(self, max_chunks: int = 64) -> list[np.ndarray]:
+        """Read currently available chunks without blocking."""
+        chunks: list[np.ndarray] = []
+        for _ in range(max_chunks):
+            try:
+                chunks.append(self._queue.get_nowait())
+            except queue.Empty:
+                break
+        return chunks
+
+    def clear(self) -> None:
+        """Clear pending queued audio chunks."""
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
