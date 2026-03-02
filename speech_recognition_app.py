@@ -1,7 +1,9 @@
 """PyQt6 UI for the speech processing demo app."""
 
 import sys
-from typing import List, Tuple
+import os
+import time
+from typing import List, Tuple, Optional
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -90,6 +92,7 @@ from dictionary_store import (
     load_dictionary,
 )
 from speech_hmm import recognize_with_hmm_discrete, recognize_with_hmm_continuous
+from speech_proximity import ProximityIndexManager, INDEX_TYPES
 from audio_io import AudioIOError, is_available, play_audio as play_audio_buffer, record_audio, stop_playback
 from audio_io import RealtimeAudioStream
 
@@ -123,6 +126,10 @@ class SpeechRecognitionApp(QMainWindow):
         self.rt_kf_state = 0.0
         self.rt_kf_var = 1.0
         self.rt_running = False
+        self.prox_index_manager: Optional[ProximityIndexManager] = None
+        self.prox_last_build_ms = 0.0
+        self.prox_last_load_ms = 0.0
+        self.prox_last_query_ms = 0.0
         self.init_ui()
 
     def init_ui(self):
@@ -136,11 +143,14 @@ class SpeechRecognitionApp(QMainWindow):
 
         recognition_page = QWidget()
         kalman_page = QWidget()
+        proximity_page = QWidget()
         self.mode_stack.addWidget(recognition_page)
         self.mode_stack.addWidget(kalman_page)
+        self.mode_stack.addWidget(proximity_page)
 
         self._build_recognition_page(recognition_page)
         self._build_kalman_page(kalman_page)
+        self._build_proximity_page(proximity_page)
 
         mode_menu = self.menuBar().addMenu("Mode")
         rec_action = QAction("Speech Recognition", self)
@@ -149,6 +159,9 @@ class SpeechRecognitionApp(QMainWindow):
         kalman_action = QAction("Kalman Speech Following", self)
         kalman_action.triggered.connect(self._switch_to_kalman)
         mode_menu.addAction(kalman_action)
+        prox_action = QAction("Indexed Proximity Recognition", self)
+        prox_action.triggered.connect(self._switch_to_proximity)
+        mode_menu.addAction(prox_action)
 
     def _build_recognition_page(self, page: QWidget):
         """Build speech processing/recognition page."""
@@ -455,6 +468,86 @@ class SpeechRecognitionApp(QMainWindow):
         self.kalman_status_label.setWordWrap(True)
         layout.addWidget(self.kalman_status_label)
 
+    def _build_proximity_page(self, page: QWidget):
+        """Build indexed proximity recognition page."""
+        layout = QVBoxLayout(page)
+
+        self.prox_figure = Figure(figsize=(6, 3))
+        self.prox_canvas = FigureCanvas(self.prox_figure)
+        layout.addWidget(self.prox_canvas, stretch=3)
+        self.prox_ax = self.prox_figure.add_subplot(111)
+        self.prox_ax.set_title("LSH Alignment Constellation")
+        self.prox_ax.set_xlabel("Alignment Position")
+        self.prox_ax.set_ylabel("Feature Row")
+
+        controls_group = QGroupBox("Proximity Index Controls")
+        controls = QGridLayout(controls_group)
+        layout.addWidget(controls_group, stretch=1)
+
+        controls.addWidget(QLabel("Feature type"), 0, 0)
+        self.prox_feature_combo = QComboBox()
+        self.prox_feature_combo.addItems(["mfcc", "bark", "lpc", "wavelet"])
+        controls.addWidget(self.prox_feature_combo, 0, 1)
+
+        controls.addWidget(QLabel("Index type"), 1, 0)
+        self.prox_index_combo = QComboBox()
+        self.prox_index_combo.addItems(list(INDEX_TYPES))
+        controls.addWidget(self.prox_index_combo, 1, 1)
+
+        controls.addWidget(QLabel("Top-k"), 2, 0)
+        self.prox_topk_spin = QSpinBox()
+        self.prox_topk_spin.setRange(1, 10)
+        self.prox_topk_spin.setValue(3)
+        controls.addWidget(self.prox_topk_spin, 2, 1)
+        controls.addWidget(QLabel("Rec: 1-5"), 2, 2)
+
+        controls.addWidget(QLabel("Candidate pool"), 3, 0)
+        self.prox_pool_spin = QSpinBox()
+        self.prox_pool_spin.setRange(4, 256)
+        self.prox_pool_spin.setValue(32)
+        controls.addWidget(self.prox_pool_spin, 3, 1)
+        controls.addWidget(QLabel("Rec: 16-64"), 3, 2)
+
+        self.prox_init_btn = QPushButton("Init Empty Index")
+        self.prox_init_btn.clicked.connect(self.prox_init_index)
+        controls.addWidget(self.prox_init_btn, 4, 0)
+
+        self.prox_add_one_btn = QPushButton("Add Dictionary Entry")
+        self.prox_add_one_btn.clicked.connect(self.prox_add_one_entry)
+        controls.addWidget(self.prox_add_one_btn, 4, 1)
+
+        self.prox_build_full_btn = QPushButton("Build Full Index")
+        self.prox_build_full_btn.clicked.connect(self.prox_build_full_index)
+        controls.addWidget(self.prox_build_full_btn, 4, 2)
+
+        self.prox_save_btn = QPushButton("Save Index")
+        self.prox_save_btn.clicked.connect(self.prox_save_index)
+        controls.addWidget(self.prox_save_btn, 5, 0)
+
+        self.prox_load_btn = QPushButton("Load Index")
+        self.prox_load_btn.clicked.connect(self.prox_load_index)
+        controls.addWidget(self.prox_load_btn, 5, 1)
+
+        self.prox_query_btn = QPushButton("Query Indexed Recognition")
+        self.prox_query_btn.clicked.connect(self.prox_query_index)
+        controls.addWidget(self.prox_query_btn, 5, 2)
+
+        self.prox_status_label = QLabel(
+            "Initialize or load an index, add dictionary words, then query with a segmented utterance."
+        )
+        self.prox_status_label.setWordWrap(True)
+        layout.addWidget(self.prox_status_label)
+
+        stats_group = QGroupBox("Index Stats")
+        stats_layout = QVBoxLayout(stats_group)
+        self.prox_stats_label = QLabel("No index loaded.")
+        self.prox_stats_label.setWordWrap(True)
+        stats_layout.addWidget(self.prox_stats_label)
+        self.prox_refresh_stats_btn = QPushButton("Refresh Stats")
+        self.prox_refresh_stats_btn.clicked.connect(self.prox_refresh_stats)
+        stats_layout.addWidget(self.prox_refresh_stats_btn)
+        layout.addWidget(stats_group)
+
     def _switch_to_recognition(self):
         if self.rt_running:
             self.stop_realtime_kalman()
@@ -462,6 +555,11 @@ class SpeechRecognitionApp(QMainWindow):
 
     def _switch_to_kalman(self):
         self.mode_stack.setCurrentIndex(1)
+
+    def _switch_to_proximity(self):
+        if self.rt_running:
+            self.stop_realtime_kalman()
+        self.mode_stack.setCurrentIndex(2)
 
     def _reset_realtime_kalman_buffers(self):
         self.rt_pending_samples = np.array([], dtype=np.float32)
@@ -661,6 +759,304 @@ class SpeechRecognitionApp(QMainWindow):
             self.codebook_size_spin.setValue(28)
             self.hmm_iters_spin.setValue(8)
         self.status_label.setText(f"Preset applied: {preset}")
+
+    def _extract_features_by_type(self, samples: np.ndarray, feature_type: str, params: dict) -> np.ndarray:
+        """Extract feature matrix from samples according to selected feature type."""
+        if feature_type == "mfcc":
+            return compute_mfcc(
+                samples,
+                self.fs,
+                num_filters=DEFAULT_MEL_FILTERS,
+                num_ceps=DEFAULT_MEL_FILTERS,
+                frame_ms=params["frame_ms"],
+                hop_ms=params["hop_ms"],
+                fmin=DEFAULT_MEL_FMIN_HZ,
+                fmax=DEFAULT_MEL_FMAX_HZ,
+                pre_emphasis=params["pre_emphasis"],
+            )
+        if feature_type == "bark":
+            return compute_bark_band_energies(
+                samples,
+                self.fs,
+                frame_ms=params["frame_ms"],
+                hop_ms=params["hop_ms"],
+                pre_emphasis=params["pre_emphasis"],
+            )
+        if feature_type == "lpc":
+            return compute_lpc_features(
+                samples,
+                self.fs,
+                order=params["lpc_order"],
+                frame_ms=params["frame_ms"],
+                hop_ms=params["hop_ms"],
+                pre_emphasis=params["pre_emphasis"],
+            )
+        return compute_wavelet_features(
+            samples,
+            self.fs,
+            min_scale=params["wav_min"],
+            max_scale=params["wav_max"],
+            frame_ms=params["frame_ms"],
+            hop_ms=params["hop_ms"],
+            pre_emphasis=params["pre_emphasis"],
+        )
+
+    def _proximity_index_path(self) -> str:
+        """Build default disk path for current proximity index selection."""
+        feature_type = self.prox_feature_combo.currentText()
+        index_type = self.prox_index_combo.currentText()
+        out_dir = os.path.join(os.getcwd(), "proximity_indexes")
+        os.makedirs(out_dir, exist_ok=True)
+        return os.path.join(out_dir, f"{index_type}_{feature_type}.pidx.gz")
+
+    def _format_bytes(self, value: float) -> str:
+        """Human-readable memory size string."""
+        units = ["B", "KB", "MB", "GB"]
+        v = float(max(0.0, value))
+        idx = 0
+        while v >= 1024.0 and idx < len(units) - 1:
+            v /= 1024.0
+            idx += 1
+        return f"{v:.2f} {units[idx]}"
+
+    def prox_refresh_stats(self):
+        """Refresh proximity index stats panel."""
+        manager = self.prox_index_manager
+        if manager is None or not manager.items:
+            self.prox_stats_label.setText("No index loaded.")
+            return
+        stats = manager.get_stats()
+        label_summary = ", ".join(
+            f"{lab}:{cnt}" for lab, cnt in sorted(stats["label_counts"].items())[:8]
+        )
+        if len(stats["label_counts"]) > 8:
+            label_summary += ", ..."
+        self.prox_stats_label.setText(
+            "\n".join(
+                [
+                    f"Index: {stats['index_type']} | Feature: {stats['feature_type']}",
+                    f"Items: {stats['items']} | Labels: {stats['labels']} | Dim: {stats['feature_dims']}",
+                    f"Frames total: {stats['total_frames']} | Avg frames/item: {stats['avg_frames_per_item']:.1f}",
+                    f"Data memory: {self._format_bytes(stats['data_bytes'])}",
+                    f"Index state: {self._format_bytes(stats['index_state_bytes'])}",
+                    f"Estimated total: {self._format_bytes(stats['estimated_total_bytes'])}",
+                    f"Last build: {self.prox_last_build_ms:.1f} ms | Last load: {self.prox_last_load_ms:.1f} ms | Last query: {self.prox_last_query_ms:.1f} ms",
+                    f"Labels detail: {label_summary if label_summary else 'n/a'}",
+                ]
+            )
+        )
+
+    def _ensure_proximity_manager(self, reset_if_mismatch: bool = False) -> ProximityIndexManager:
+        """Ensure proximity manager exists and matches selected feature/index types."""
+        feature_type = self.prox_feature_combo.currentText()
+        index_type = self.prox_index_combo.currentText()
+        if self.prox_index_manager is None:
+            self.prox_index_manager = ProximityIndexManager(feature_type=feature_type, index_type=index_type)
+            return self.prox_index_manager
+        if (
+            self.prox_index_manager.feature_type != feature_type
+            or self.prox_index_manager.index_type != index_type
+        ):
+            if reset_if_mismatch:
+                self.prox_index_manager.reset(feature_type=feature_type, index_type=index_type)
+            else:
+                self.prox_index_manager = ProximityIndexManager(feature_type=feature_type, index_type=index_type)
+        return self.prox_index_manager
+
+    def prox_init_index(self):
+        """Initialize an empty proximity index for current UI selections."""
+        manager = self._ensure_proximity_manager(reset_if_mismatch=True)
+        manager.reset(
+            feature_type=self.prox_feature_combo.currentText(),
+            index_type=self.prox_index_combo.currentText(),
+        )
+        self.prox_ax.clear()
+        self.prox_ax.set_title("LSH Alignment Constellation")
+        self.prox_ax.set_xlabel("Alignment Position")
+        self.prox_ax.set_ylabel("Feature Row")
+        self.prox_canvas.draw()
+        self.prox_status_label.setText(
+            f"Initialized empty index ({manager.index_type}, feature={manager.feature_type})."
+        )
+        self.prox_last_build_ms = 0.0
+        self.prox_last_query_ms = 0.0
+        self.prox_refresh_stats()
+
+    def prox_add_one_entry(self):
+        """Add one dictionary entry into the current proximity index."""
+        dictionary = load_dictionary(self.dictionary_file)
+        if not dictionary:
+            QMessageBox.warning(self, "No dictionary", "Dictionary is empty. Save some words first.")
+            return
+        manager = self._ensure_proximity_manager(reset_if_mismatch=False)
+        if (
+            manager.feature_type != self.prox_feature_combo.currentText()
+            or manager.index_type != self.prox_index_combo.currentText()
+        ):
+            QMessageBox.information(
+                self,
+                "Index mismatch",
+                "Feature/index selection changed. Click 'Init Empty Index' before adding entries.",
+            )
+            return
+
+        indexed_sources = {item.source_index for item in manager.items.values() if item.source_index >= 0}
+        feature_type = self.prox_feature_combo.currentText()
+        options = []
+        option_idxs = []
+        for idx, entry in enumerate(dictionary):
+            if entry.get("feature_type", "mfcc") != feature_type:
+                continue
+            if idx in indexed_sources:
+                continue
+            options.append(f"{idx}: {entry.get('label', f'entry_{idx}')}")
+            option_idxs.append(idx)
+        if not options:
+            QMessageBox.information(self, "No pending entries", "No remaining dictionary entries to add.")
+            return
+
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Add Dictionary Entry",
+            "Select one entry to insert:",
+            options,
+            0,
+            False,
+        )
+        if not ok:
+            return
+        src_idx = option_idxs[options.index(choice)]
+        if not manager.add_dictionary_entry(dictionary[src_idx], source_index=src_idx):
+            QMessageBox.warning(self, "Skipped", "Selected dictionary entry has invalid feature data.")
+            return
+        self.prox_status_label.setText(
+            f"Inserted one entry. Indexed words: {len(manager.items)}."
+        )
+        self.prox_refresh_stats()
+
+    def prox_build_full_index(self):
+        """Build index from all dictionary entries matching selected feature type."""
+        dictionary = load_dictionary(self.dictionary_file)
+        if not dictionary:
+            QMessageBox.warning(self, "No dictionary", "Dictionary is empty. Save some words first.")
+            return
+        t0 = time.perf_counter()
+        manager = self._ensure_proximity_manager(reset_if_mismatch=True)
+        manager.reset(
+            feature_type=self.prox_feature_combo.currentText(),
+            index_type=self.prox_index_combo.currentText(),
+        )
+        added = manager.ingest_dictionary(dictionary)
+        self.prox_last_build_ms = (time.perf_counter() - t0) * 1000.0
+        self.prox_status_label.setText(
+            f"Built index: {added} entries ({manager.index_type}, feature={manager.feature_type}) in {self.prox_last_build_ms:.1f} ms."
+        )
+        self.prox_refresh_stats()
+
+    def prox_save_index(self):
+        """Save active proximity index to compressed disk format."""
+        manager = self._ensure_proximity_manager(reset_if_mismatch=False)
+        if not manager.items:
+            QMessageBox.information(self, "Empty index", "No indexed words to save.")
+            return
+        path = self._proximity_index_path()
+        manager.save(path)
+        self.prox_status_label.setText(f"Index saved to {path}")
+        self.prox_refresh_stats()
+
+    def prox_load_index(self):
+        """Load proximity index from compressed disk format."""
+        path = self._proximity_index_path()
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "Missing index", f"No index file found at:\n{path}")
+            return
+        t0 = time.perf_counter()
+        manager = ProximityIndexManager.load(path)
+        self.prox_last_load_ms = (time.perf_counter() - t0) * 1000.0
+        self.prox_index_manager = manager
+        self.prox_feature_combo.setCurrentText(manager.feature_type)
+        self.prox_index_combo.setCurrentText(manager.index_type)
+        self.prox_status_label.setText(
+            f"Loaded index: {len(manager.items)} entries ({manager.index_type}, feature={manager.feature_type}) in {self.prox_last_load_ms:.1f} ms."
+        )
+        self.prox_refresh_stats()
+
+    def prox_query_index(self):
+        """Query indexed dictionary words using selected segmented utterance."""
+        if self.audio_data.size == 0:
+            QMessageBox.warning(self, "No audio", "Record audio before querying.")
+            return
+        if not self.segments:
+            QMessageBox.warning(self, "No segments", "Segment audio before querying.")
+            return
+        manager = self._ensure_proximity_manager(reset_if_mismatch=False)
+        if not manager.items:
+            QMessageBox.warning(self, "No index", "Build or load an index first.")
+            return
+        if (
+            manager.feature_type != self.prox_feature_combo.currentText()
+            or manager.index_type != self.prox_index_combo.currentText()
+        ):
+            QMessageBox.information(
+                self,
+                "Index mismatch",
+                "Current selection differs from loaded index. Load/rebuild index for current selection.",
+            )
+            return
+
+        seg_idx = self._select_segment_index("query indexed recognition")
+        if seg_idx < 0:
+            return
+        start, end = self.segments[seg_idx]
+        params = self._current_params()
+        feature_type = self.prox_feature_combo.currentText()
+        query_features = self._extract_features_by_type(self.audio_data[start:end], feature_type, params)
+        if query_features.size == 0:
+            QMessageBox.information(self, "No features", "Could not extract features from selected segment.")
+            return
+
+        t0 = time.perf_counter()
+        result = manager.query(
+            query_features,
+            top_k=int(self.prox_topk_spin.value()),
+            candidate_pool=int(self.prox_pool_spin.value()),
+        )
+        self.prox_last_query_ms = (time.perf_counter() - t0) * 1000.0
+        matches = result.get("matches", [])
+        if not matches:
+            QMessageBox.information(self, "No match", "No matches returned by index.")
+            return
+
+        lines = [
+            f"{i + 1}. {m['label']} (DTW={m['distance']:.3f}, item_id={m['item_id']})"
+            for i, m in enumerate(matches)
+        ]
+        QMessageBox.information(
+            self,
+            "Indexed Recognition",
+            (
+                f"Index type: {manager.index_type}\n"
+                f"Feature type: {manager.feature_type}\n"
+                f"Candidates evaluated: {result.get('candidate_count', 0)}\n\n"
+                + "\n".join(lines)
+            ),
+        )
+        self.prox_status_label.setText(
+            f"Best match: {matches[0]['label']} (DTW={matches[0]['distance']:.3f}) in {self.prox_last_query_ms:.1f} ms."
+        )
+        self.prox_refresh_stats()
+
+        alignment = result.get("lsh_alignment")
+        if alignment and isinstance(alignment.get("constellation"), list):
+            matrix = np.array(alignment["constellation"], dtype=float)
+            self.prox_ax.clear()
+            self.prox_ax.imshow(matrix, origin="lower", aspect="auto", cmap="magma")
+            self.prox_ax.set_title(
+                f"LSH Constellation vs {alignment.get('best_label', '?')} (DTW={alignment.get('distance', np.nan):.3f})"
+            )
+            self.prox_ax.set_xlabel("Alignment Position")
+            self.prox_ax.set_ylabel("Feature Row")
+            self.prox_canvas.draw()
 
     def _select_audio_for_view(self) -> np.ndarray:
         """Select whole recording or one detected segment for visualization."""

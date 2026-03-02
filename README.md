@@ -7,6 +7,7 @@ Desktop app for recording speech, segmenting isolated words, extracting features
 - Mode menu to switch between:
   - `Speech Recognition`
   - `Kalman Speech Following`
+  - `Indexed Proximity Recognition`
 - Record audio from microphone.
 - Segment speech with short-time methods (`energy`, `zcr`, `energy_zcr`, `entropy`).
 - Segmentation uses adaptive robust thresholds + feature smoothing + hysteresis/hangover + post-merge/min-duration cleanup.
@@ -22,6 +23,13 @@ Desktop app for recording speech, segmenting isolated words, extracting features
   - `dtw`
   - `hmm-discrete` (with clustering + vector codebook quantization)
   - `hmm-continuous` (Gaussian emissions)
+  - Note: HMM models are trained on-the-fly at compare time from current dictionary entries (not persisted pre-trained models).
+- Indexed recognition with DTW re-ranking over proximity structures:
+  - `bktree`
+  - `fqt`
+  - `fixed_height_fqt`
+  - `permutation` (pivot-permutation index)
+  - `lsh` (with alignment constellation visualization)
 - Visualize **Spectrogram** and **Cepstrogram** from recorded audio/segments.
 - Visualize **Wavelet Scalogram** (frame-scale energy diagram).
 - Run **LPC Speech Synthesis** (analyze/resynthesize) and playback.
@@ -34,6 +42,7 @@ Desktop app for recording speech, segmenting isolated words, extracting features
 - `speech_recognition_app.py`: PyQt6 UI and user interaction flow only.
 - `speech_dsp.py`: digital signal processing and feature extraction logic.
 - `speech_hmm.py`: HMM recognition backends (discrete and continuous).
+- `speech_proximity.py`: proximity index abstractions, persistence, and DTW-based indexed query.
 - `dictionary_store.py`: dictionary schema creation, persistence, and lookup helpers.
 - `audio_io.py`: audio capture/playback adapter over `sounddevice`.
 
@@ -91,6 +100,20 @@ python3 speech_recognition_app.py
 5. Or click **Start Live** to track microphone energy in real time, then **Stop Live**.
 6. In live mode, confidence is shown as a percentage based on the rolling innovation stability.
 7. Optional: **Play Source**.
+
+## Indexed Proximity Recognition Mode
+
+1. Open menu **Mode -> Indexed Proximity Recognition**.
+2. Select **Feature type** (`mfcc`, `bark`, `lpc`, `wavelet`).
+3. Select **Index type** (`bktree`, `fqt`, `fixed_height_fqt`, `permutation`, `lsh`).
+4. Build index data:
+   - **Init Empty Index** then **Add Dictionary Entry** repeatedly (one-by-one indexing), or
+   - **Build Full Index** to ingest all matching dictionary entries at once.
+5. Save/load optimized compressed index snapshots with **Save Index** / **Load Index**.
+6. Record + segment an utterance in recognition mode, then click **Query Indexed Recognition**.
+7. Distances are always computed with **DTW** on candidate matches.
+8. For `lsh`, the plot renders an alignment constellation image by feature row.
+9. Use **Index Stats** panel to monitor indexed items/labels, feature dimensions, estimated memory, and latest build/load/query timings.
 
 ## Recommended Ranges (UI Labels)
 

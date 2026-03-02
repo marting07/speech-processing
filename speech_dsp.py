@@ -886,6 +886,52 @@ def dtw_distance(seq1: np.ndarray, seq2: np.ndarray) -> float:
     return cost[n1, n2] / (n1 + n2)
 
 
+def dtw_distance_with_path(seq1: np.ndarray, seq2: np.ndarray) -> Tuple[float, List[Tuple[int, int]]]:
+    """Compute normalized DTW distance and one optimal alignment path."""
+    n1, d1 = seq1.shape
+    n2, d2 = seq2.shape
+    if d1 != d2:
+        raise ValueError("Feature dimensions do not match")
+    if n1 == 0 or n2 == 0:
+        return float("inf"), []
+
+    cost = np.full((n1 + 1, n2 + 1), np.inf)
+    back = np.full((n1 + 1, n2 + 1), -1, dtype=int)
+    cost[0, 0] = 0.0
+    for i in range(1, n1 + 1):
+        for j in range(1, n2 + 1):
+            dist = np.linalg.norm(seq1[i - 1] - seq2[j - 1])
+            c_diag = cost[i - 1, j - 1] + 2.0 * dist
+            c_up = cost[i - 1, j] + dist
+            c_left = cost[i, j - 1] + dist
+            if c_diag <= c_up and c_diag <= c_left:
+                cost[i, j] = c_diag
+                back[i, j] = 0
+            elif c_up <= c_left:
+                cost[i, j] = c_up
+                back[i, j] = 1
+            else:
+                cost[i, j] = c_left
+                back[i, j] = 2
+
+    i, j = n1, n2
+    path: List[Tuple[int, int]] = []
+    while i > 0 and j > 0:
+        path.append((i - 1, j - 1))
+        step = back[i, j]
+        if step == 0:
+            i -= 1
+            j -= 1
+        elif step == 1:
+            i -= 1
+        elif step == 2:
+            j -= 1
+        else:
+            break
+    path.reverse()
+    return cost[n1, n2] / (n1 + n2), path
+
+
 def matrix_to_indexed_rows(matrix: np.ndarray, value_key: str) -> List[Dict[str, Any]]:
     """Serialize a 2-D feature matrix to dictionary row format."""
     rows = []
