@@ -51,6 +51,16 @@ Desktop app for recording speech, segmenting isolated words, extracting features
 - `dataset_tools.py`: MSWC ingestion and audio loading/resampling utilities.
 - `speech_ann.py`: from-scratch ANN (MLP) training/evaluation/inference.
 - `speech_hmm_persist.py`: persisted HMM bundle training/save/load/query.
+
+## Recognition Docs
+
+- Reimplementation guides per recognition system:
+  - `docs/recognition/README.md`
+  - `docs/recognition/dtw_baseline.md`
+  - `docs/recognition/hmm_online.md`
+  - `docs/recognition/proximity_indexes.md`
+  - `docs/recognition/ann_recognition.md`
+  - `docs/recognition/hmm_persisted.md`
 - `dictionary_store.py`: dictionary schema creation, persistence, and lookup helpers.
 - `audio_io.py`: audio capture/playback adapter over `sounddevice`.
 
