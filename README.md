@@ -8,6 +8,8 @@ Desktop app for recording speech, segmenting isolated words, extracting features
   - `Speech Recognition`
   - `Kalman Speech Following`
   - `Indexed Proximity Recognition`
+  - `ANN Recognition`
+  - `HMM Persisted Recognition`
 - Record audio from microphone.
 - Segment speech with short-time methods (`energy`, `zcr`, `energy_zcr`, `entropy`).
 - Segmentation uses adaptive robust thresholds + feature smoothing + hysteresis/hangover + post-merge/min-duration cleanup.
@@ -30,6 +32,9 @@ Desktop app for recording speech, segmenting isolated words, extracting features
   - `fixed_height_fqt`
   - `permutation` (pivot-permutation index)
   - `lsh` (with alignment constellation visualization)
+- Import `MSWC` utterances into dictionary as MFCC entries (language/filter caps in UI).
+- ANN recognition mode (from-scratch MLP): preprocessing, feature extraction, train/test, save/load, segment classification.
+- Persisted HMM mode: train/save/load pre-trained HMM bundles and classify new segments.
 - Visualize **Spectrogram** and **Cepstrogram** from recorded audio/segments.
 - Visualize **Wavelet Scalogram** (frame-scale energy diagram).
 - Run **LPC Speech Synthesis** (analyze/resynthesize) and playback.
@@ -43,6 +48,9 @@ Desktop app for recording speech, segmenting isolated words, extracting features
 - `speech_dsp.py`: digital signal processing and feature extraction logic.
 - `speech_hmm.py`: HMM recognition backends (discrete and continuous).
 - `speech_proximity.py`: proximity index abstractions, persistence, and DTW-based indexed query.
+- `dataset_tools.py`: MSWC ingestion and audio loading/resampling utilities.
+- `speech_ann.py`: from-scratch ANN (MLP) training/evaluation/inference.
+- `speech_hmm_persist.py`: persisted HMM bundle training/save/load/query.
 - `dictionary_store.py`: dictionary schema creation, persistence, and lookup helpers.
 - `audio_io.py`: audio capture/playback adapter over `sounddevice`.
 
@@ -114,6 +122,33 @@ python3 speech_recognition_app.py
 7. Distances are always computed with **DTW** on candidate matches.
 8. For `lsh`, the plot renders an alignment constellation image by feature row.
 9. Use **Index Stats** panel to monitor indexed items/labels, feature dimensions, estimated memory, and latest build/load/query timings.
+
+### MSWC Import (Inside Proximity Mode)
+
+1. Ensure dataset folder exists at `mswc_microset/` in project root.
+2. Select language (`es`, `en`, `es+en`).
+3. Set `MSWC max per label` (`0` means all per label).
+4. Set `MSWC max/language` (`0` means no language cap).
+5. Click **Import MSWC -> Dictionary (MFCC)**.
+
+Note: the microset can be very large; keep caps for practical imports and gradually increase.
+
+## ANN Recognition Mode
+
+1. Open menu **Mode -> ANN Recognition**.
+2. Select feature type and ANN hyperparameters (hidden units, epochs, learning rate, test ratio).
+3. Click **Train ANN** (trained from dictionary entries of selected feature type).
+4. Click **Test ANN** to evaluate on held-out split.
+5. Use **Save ANN Model** / **Load ANN Model** for persistence.
+6. Record + segment a new utterance and click **Classify Selected Segment**.
+
+## HMM Persisted Recognition Mode
+
+1. Open menu **Mode -> HMM Persisted Recognition**.
+2. Select feature type and HMM type (`discrete` or `continuous`) plus training parameters.
+3. Click **Train Persisted HMM** to build per-label models from dictionary.
+4. Save/load bundles with **Save HMM Bundle** / **Load HMM Bundle**.
+5. Record + segment a new utterance and click **Classify Selected Segment**.
 
 ## Recommended Ranges (UI Labels)
 

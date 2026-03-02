@@ -93,6 +93,24 @@ from dictionary_store import (
 )
 from speech_hmm import recognize_with_hmm_discrete, recognize_with_hmm_continuous
 from speech_proximity import ProximityIndexManager, INDEX_TYPES
+from dataset_tools import import_mswc_to_dictionary
+from speech_ann import (
+    AnnModel,
+    classify_query_vector,
+    dataset_from_dictionary,
+    evaluate_ann,
+    feature_matrix_to_vector,
+    load_ann_model,
+    save_ann_model,
+    train_ann,
+    train_test_split_indices,
+)
+from speech_hmm_persist import (
+    load_hmm_bundle,
+    query_persisted_hmm,
+    save_hmm_bundle,
+    train_persisted_hmm_models,
+)
 from audio_io import AudioIOError, is_available, play_audio as play_audio_buffer, record_audio, stop_playback
 from audio_io import RealtimeAudioStream
 
@@ -130,6 +148,9 @@ class SpeechRecognitionApp(QMainWindow):
         self.prox_last_build_ms = 0.0
         self.prox_last_load_ms = 0.0
         self.prox_last_query_ms = 0.0
+        self.ann_model: Optional[AnnModel] = None
+        self.ann_last_test_metrics = {"accuracy": 0.0, "loss": float("inf")}
+        self.hmm_persist_bundle: Optional[dict] = None
         self.init_ui()
 
     def init_ui(self):
@@ -144,13 +165,19 @@ class SpeechRecognitionApp(QMainWindow):
         recognition_page = QWidget()
         kalman_page = QWidget()
         proximity_page = QWidget()
+        ann_page = QWidget()
+        hmm_page = QWidget()
         self.mode_stack.addWidget(recognition_page)
         self.mode_stack.addWidget(kalman_page)
         self.mode_stack.addWidget(proximity_page)
+        self.mode_stack.addWidget(ann_page)
+        self.mode_stack.addWidget(hmm_page)
 
         self._build_recognition_page(recognition_page)
         self._build_kalman_page(kalman_page)
         self._build_proximity_page(proximity_page)
+        self._build_ann_page(ann_page)
+        self._build_hmm_persist_page(hmm_page)
 
         mode_menu = self.menuBar().addMenu("Mode")
         rec_action = QAction("Speech Recognition", self)
@@ -162,6 +189,12 @@ class SpeechRecognitionApp(QMainWindow):
         prox_action = QAction("Indexed Proximity Recognition", self)
         prox_action.triggered.connect(self._switch_to_proximity)
         mode_menu.addAction(prox_action)
+        ann_action = QAction("ANN Recognition", self)
+        ann_action.triggered.connect(self._switch_to_ann)
+        mode_menu.addAction(ann_action)
+        hmm_p_action = QAction("HMM Persisted Recognition", self)
+        hmm_p_action.triggered.connect(self._switch_to_hmm_persist)
+        mode_menu.addAction(hmm_p_action)
 
     def _build_recognition_page(self, page: QWidget):
         """Build speech processing/recognition page."""
@@ -532,6 +565,28 @@ class SpeechRecognitionApp(QMainWindow):
         self.prox_query_btn.clicked.connect(self.prox_query_index)
         controls.addWidget(self.prox_query_btn, 5, 2)
 
+        controls.addWidget(QLabel("MSWC language"), 6, 0)
+        self.mswc_lang_combo = QComboBox()
+        self.mswc_lang_combo.addItems(["es", "en", "es+en"])
+        controls.addWidget(self.mswc_lang_combo, 6, 1)
+        controls.addWidget(QLabel("Max/label (0=all)"), 6, 2)
+
+        controls.addWidget(QLabel("MSWC max per label"), 7, 0)
+        self.mswc_limit_spin = QSpinBox()
+        self.mswc_limit_spin.setRange(0, 5000)
+        self.mswc_limit_spin.setValue(20)
+        controls.addWidget(self.mswc_limit_spin, 7, 1)
+
+        controls.addWidget(QLabel("MSWC max/language"), 8, 0)
+        self.mswc_lang_cap_spin = QSpinBox()
+        self.mswc_lang_cap_spin.setRange(0, 50000)
+        self.mswc_lang_cap_spin.setValue(2000)
+        controls.addWidget(self.mswc_lang_cap_spin, 8, 1)
+
+        self.import_mswc_btn = QPushButton("Import MSWC -> Dictionary (MFCC)")
+        self.import_mswc_btn.clicked.connect(self.import_mswc_dataset)
+        controls.addWidget(self.import_mswc_btn, 9, 0, 1, 3)
+
         self.prox_status_label = QLabel(
             "Initialize or load an index, add dictionary words, then query with a segmented utterance."
         )
@@ -548,6 +603,127 @@ class SpeechRecognitionApp(QMainWindow):
         stats_layout.addWidget(self.prox_refresh_stats_btn)
         layout.addWidget(stats_group)
 
+    def _build_ann_page(self, page: QWidget):
+        """Build ANN recognition/training page."""
+        layout = QVBoxLayout(page)
+        controls_group = QGroupBox("ANN Controls")
+        controls = QGridLayout(controls_group)
+        layout.addWidget(controls_group)
+
+        controls.addWidget(QLabel("Feature type"), 0, 0)
+        self.ann_feature_combo = QComboBox()
+        self.ann_feature_combo.addItems(["mfcc", "bark", "lpc", "wavelet"])
+        controls.addWidget(self.ann_feature_combo, 0, 1)
+
+        controls.addWidget(QLabel("Hidden units"), 1, 0)
+        self.ann_hidden_spin = QSpinBox()
+        self.ann_hidden_spin.setRange(8, 512)
+        self.ann_hidden_spin.setValue(64)
+        controls.addWidget(self.ann_hidden_spin, 1, 1)
+        controls.addWidget(QLabel("Rec: 32-128"), 1, 2)
+
+        controls.addWidget(QLabel("Epochs"), 2, 0)
+        self.ann_epochs_spin = QSpinBox()
+        self.ann_epochs_spin.setRange(5, 1000)
+        self.ann_epochs_spin.setValue(120)
+        controls.addWidget(self.ann_epochs_spin, 2, 1)
+
+        controls.addWidget(QLabel("Learning rate"), 3, 0)
+        self.ann_lr_spin = QDoubleSpinBox()
+        self.ann_lr_spin.setRange(0.0001, 1.0)
+        self.ann_lr_spin.setDecimals(4)
+        self.ann_lr_spin.setSingleStep(0.001)
+        self.ann_lr_spin.setValue(0.01)
+        controls.addWidget(self.ann_lr_spin, 3, 1)
+        controls.addWidget(QLabel("Rec: 0.001-0.05"), 3, 2)
+
+        controls.addWidget(QLabel("Test ratio"), 4, 0)
+        self.ann_test_ratio_spin = QDoubleSpinBox()
+        self.ann_test_ratio_spin.setRange(0.05, 0.5)
+        self.ann_test_ratio_spin.setDecimals(2)
+        self.ann_test_ratio_spin.setSingleStep(0.05)
+        self.ann_test_ratio_spin.setValue(0.2)
+        controls.addWidget(self.ann_test_ratio_spin, 4, 1)
+
+        self.ann_train_btn = QPushButton("Train ANN")
+        self.ann_train_btn.clicked.connect(self.ann_train_model)
+        controls.addWidget(self.ann_train_btn, 5, 0)
+
+        self.ann_test_btn = QPushButton("Test ANN")
+        self.ann_test_btn.clicked.connect(self.ann_test_model)
+        controls.addWidget(self.ann_test_btn, 5, 1)
+
+        self.ann_classify_btn = QPushButton("Classify Selected Segment")
+        self.ann_classify_btn.clicked.connect(self.ann_classify_segment)
+        controls.addWidget(self.ann_classify_btn, 5, 2)
+
+        self.ann_save_btn = QPushButton("Save ANN Model")
+        self.ann_save_btn.clicked.connect(self.ann_save_model)
+        controls.addWidget(self.ann_save_btn, 6, 0)
+
+        self.ann_load_btn = QPushButton("Load ANN Model")
+        self.ann_load_btn.clicked.connect(self.ann_load_model)
+        controls.addWidget(self.ann_load_btn, 6, 1)
+
+        self.ann_status_label = QLabel("Train ANN from dictionary entries, then classify new segmented words.")
+        self.ann_status_label.setWordWrap(True)
+        layout.addWidget(self.ann_status_label)
+
+    def _build_hmm_persist_page(self, page: QWidget):
+        """Build persisted-HMM training/inference page."""
+        layout = QVBoxLayout(page)
+        controls_group = QGroupBox("Persisted HMM Controls")
+        controls = QGridLayout(controls_group)
+        layout.addWidget(controls_group)
+
+        controls.addWidget(QLabel("Feature type"), 0, 0)
+        self.hmm_p_feature_combo = QComboBox()
+        self.hmm_p_feature_combo.addItems(["mfcc", "bark", "lpc", "wavelet"])
+        controls.addWidget(self.hmm_p_feature_combo, 0, 1)
+
+        controls.addWidget(QLabel("Model type"), 1, 0)
+        self.hmm_p_type_combo = QComboBox()
+        self.hmm_p_type_combo.addItems(["discrete", "continuous"])
+        controls.addWidget(self.hmm_p_type_combo, 1, 1)
+
+        controls.addWidget(QLabel("States"), 2, 0)
+        self.hmm_p_states_spin = QSpinBox()
+        self.hmm_p_states_spin.setRange(2, 12)
+        self.hmm_p_states_spin.setValue(5)
+        controls.addWidget(self.hmm_p_states_spin, 2, 1)
+
+        controls.addWidget(QLabel("Codebook"), 3, 0)
+        self.hmm_p_codebook_spin = QSpinBox()
+        self.hmm_p_codebook_spin.setRange(8, 128)
+        self.hmm_p_codebook_spin.setValue(32)
+        controls.addWidget(self.hmm_p_codebook_spin, 3, 1)
+
+        controls.addWidget(QLabel("Iterations"), 4, 0)
+        self.hmm_p_iters_spin = QSpinBox()
+        self.hmm_p_iters_spin.setRange(1, 50)
+        self.hmm_p_iters_spin.setValue(10)
+        controls.addWidget(self.hmm_p_iters_spin, 4, 1)
+
+        self.hmm_p_train_btn = QPushButton("Train Persisted HMM")
+        self.hmm_p_train_btn.clicked.connect(self.hmm_p_train)
+        controls.addWidget(self.hmm_p_train_btn, 5, 0)
+
+        self.hmm_p_classify_btn = QPushButton("Classify Selected Segment")
+        self.hmm_p_classify_btn.clicked.connect(self.hmm_p_classify_segment)
+        controls.addWidget(self.hmm_p_classify_btn, 5, 1)
+
+        self.hmm_p_save_btn = QPushButton("Save HMM Bundle")
+        self.hmm_p_save_btn.clicked.connect(self.hmm_p_save_bundle)
+        controls.addWidget(self.hmm_p_save_btn, 6, 0)
+
+        self.hmm_p_load_btn = QPushButton("Load HMM Bundle")
+        self.hmm_p_load_btn.clicked.connect(self.hmm_p_load_bundle)
+        controls.addWidget(self.hmm_p_load_btn, 6, 1)
+
+        self.hmm_p_status_label = QLabel("Train persisted HMM models or load an existing bundle for inference.")
+        self.hmm_p_status_label.setWordWrap(True)
+        layout.addWidget(self.hmm_p_status_label)
+
     def _switch_to_recognition(self):
         if self.rt_running:
             self.stop_realtime_kalman()
@@ -560,6 +736,16 @@ class SpeechRecognitionApp(QMainWindow):
         if self.rt_running:
             self.stop_realtime_kalman()
         self.mode_stack.setCurrentIndex(2)
+
+    def _switch_to_ann(self):
+        if self.rt_running:
+            self.stop_realtime_kalman()
+        self.mode_stack.setCurrentIndex(3)
+
+    def _switch_to_hmm_persist(self):
+        if self.rt_running:
+            self.stop_realtime_kalman()
+        self.mode_stack.setCurrentIndex(4)
 
     def _reset_realtime_kalman_buffers(self):
         self.rt_pending_samples = np.array([], dtype=np.float32)
@@ -1057,6 +1243,241 @@ class SpeechRecognitionApp(QMainWindow):
             self.prox_ax.set_xlabel("Alignment Position")
             self.prox_ax.set_ylabel("Feature Row")
             self.prox_canvas.draw()
+
+    def import_mswc_dataset(self):
+        """Import MSWC utterances into dictionary as MFCC entries."""
+        dataset_root = os.path.join(os.getcwd(), "mswc_microset")
+        if not os.path.isdir(dataset_root):
+            QMessageBox.warning(self, "Dataset missing", f"MSWC dataset folder not found:\n{dataset_root}")
+            return
+        params = self._current_params()
+        lang_sel = self.mswc_lang_combo.currentText()
+        langs = ("es", "en") if lang_sel == "es+en" else (lang_sel,)
+        max_per_label = int(self.mswc_limit_spin.value())
+        if max_per_label <= 0:
+            max_per_label = None
+        max_per_lang = int(self.mswc_lang_cap_spin.value())
+        if max_per_lang <= 0:
+            max_per_lang = None
+
+        self.prox_status_label.setText("Importing MSWC to dictionary (MFCC)...")
+        self.repaint()
+        stats = import_mswc_to_dictionary(
+            dictionary_path=self.dictionary_file,
+            dataset_root=dataset_root,
+            fs=self.fs,
+            frame_ms=params["frame_ms"],
+            hop_ms=params["hop_ms"],
+            pre_emphasis=params["pre_emphasis"],
+            languages=langs,
+            max_per_label=max_per_label,
+            max_total_per_language=max_per_lang,
+        )
+        self.prox_status_label.setText(
+            f"MSWC import done: +{stats['added']} entries, skipped existing={stats['skipped_existing']}, invalid={stats['skipped_invalid']}."
+        )
+        QMessageBox.information(
+            self,
+            "MSWC Import",
+            (
+                f"Added: {stats['added']}\n"
+                f"Skipped existing: {stats['skipped_existing']}\n"
+                f"Skipped invalid: {stats['skipped_invalid']}\n"
+                f"Labels touched: {stats['labels_touched']}\n"
+                f"Candidates scanned: {stats['total_candidates']}"
+            ),
+        )
+
+    def _ann_model_path(self) -> str:
+        out_dir = os.path.join(os.getcwd(), "trained_models")
+        os.makedirs(out_dir, exist_ok=True)
+        return os.path.join(out_dir, f"ann_{self.ann_feature_combo.currentText()}.ann.gz")
+
+    def _hmm_bundle_path(self) -> str:
+        out_dir = os.path.join(os.getcwd(), "trained_models")
+        os.makedirs(out_dir, exist_ok=True)
+        feature = self.hmm_p_feature_combo.currentText()
+        mtype = self.hmm_p_type_combo.currentText()
+        return os.path.join(out_dir, f"hmm_{mtype}_{feature}.hmm.gz")
+
+    def ann_train_model(self):
+        """Train ANN model from dictionary entries."""
+        dictionary = load_dictionary(self.dictionary_file)
+        if not dictionary:
+            QMessageBox.warning(self, "No dictionary", "Dictionary is empty. Import/save entries first.")
+            return
+        feature_type = self.ann_feature_combo.currentText()
+        X, y, idx_to_label = dataset_from_dictionary(dictionary, feature_type)
+        if X.size == 0 or y.size == 0 or len(idx_to_label) < 2:
+            QMessageBox.warning(self, "Insufficient data", "Need at least 2 labels for ANN training.")
+            return
+        tr_idx, te_idx = train_test_split_indices(
+            len(y),
+            test_ratio=float(self.ann_test_ratio_spin.value()),
+            seed=13,
+        )
+        model, history = train_ann(
+            X_train=X[tr_idx],
+            y_train=y[tr_idx],
+            idx_to_label=idx_to_label,
+            feature_type=feature_type,
+            hidden_dim=int(self.ann_hidden_spin.value()),
+            epochs=int(self.ann_epochs_spin.value()),
+            lr=float(self.ann_lr_spin.value()),
+            batch_size=16,
+            seed=13,
+        )
+        self.ann_model = model
+        if te_idx.size > 0:
+            self.ann_last_test_metrics = evaluate_ann(model, X[te_idx], y[te_idx])
+        else:
+            self.ann_last_test_metrics = evaluate_ann(model, X[tr_idx], y[tr_idx])
+        self.ann_status_label.setText(
+            f"ANN trained: samples={len(y)}, labels={len(idx_to_label)}, final_train_acc={history['acc'][-1]:.3f}, test_acc={self.ann_last_test_metrics['accuracy']:.3f}."
+        )
+
+    def ann_test_model(self):
+        """Evaluate current ANN on a random held-out split from dictionary."""
+        if self.ann_model is None:
+            QMessageBox.warning(self, "No ANN model", "Train or load ANN model first.")
+            return
+        dictionary = load_dictionary(self.dictionary_file)
+        X, y, _ = dataset_from_dictionary(dictionary, self.ann_model.feature_type)
+        if X.size == 0:
+            QMessageBox.warning(self, "No data", "No matching feature data found in dictionary.")
+            return
+        _, te_idx = train_test_split_indices(
+            len(y),
+            test_ratio=float(self.ann_test_ratio_spin.value()),
+            seed=23,
+        )
+        metrics = evaluate_ann(self.ann_model, X[te_idx], y[te_idx]) if te_idx.size > 0 else evaluate_ann(self.ann_model, X, y)
+        self.ann_last_test_metrics = metrics
+        self.ann_status_label.setText(
+            f"ANN test: accuracy={metrics['accuracy']:.3f}, loss={metrics['loss']:.4f}, samples={(te_idx.size if te_idx.size > 0 else len(y))}."
+        )
+
+    def ann_save_model(self):
+        """Save ANN model to disk."""
+        if self.ann_model is None:
+            QMessageBox.warning(self, "No ANN model", "Train or load ANN model first.")
+            return
+        path = self._ann_model_path()
+        save_ann_model(self.ann_model, path)
+        self.ann_status_label.setText(f"ANN model saved: {path}")
+
+    def ann_load_model(self):
+        """Load ANN model from disk."""
+        path = self._ann_model_path()
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "Missing model", f"ANN model file not found:\n{path}")
+            return
+        self.ann_model = load_ann_model(path)
+        self.ann_feature_combo.setCurrentText(self.ann_model.feature_type)
+        self.ann_status_label.setText(
+            f"ANN model loaded: feature={self.ann_model.feature_type}, hidden={self.ann_model.hidden_dim}, classes={self.ann_model.n_classes}."
+        )
+
+    def ann_classify_segment(self):
+        """Classify selected segment with trained ANN."""
+        if self.ann_model is None:
+            QMessageBox.warning(self, "No ANN model", "Train or load ANN model first.")
+            return
+        if self.audio_data.size == 0 or not self.segments:
+            QMessageBox.warning(self, "No segment", "Record and segment audio first.")
+            return
+        seg_idx = self._select_segment_index("classify with ANN")
+        if seg_idx < 0:
+            return
+        start, end = self.segments[seg_idx]
+        params = self._current_params()
+        feats = self._extract_features_by_type(self.audio_data[start:end], self.ann_model.feature_type, params)
+        if feats.size == 0:
+            QMessageBox.warning(self, "No features", "Feature extraction failed for selected segment.")
+            return
+        vec = feature_matrix_to_vector(feats)
+        label, conf = classify_query_vector(self.ann_model, vec)
+        self.ann_status_label.setText(f"ANN prediction: {label} (confidence={conf:.3f}).")
+        QMessageBox.information(self, "ANN Recognition", f"Predicted label: {label}\nConfidence: {conf:.3f}")
+
+    def hmm_p_train(self):
+        """Train persisted HMM bundle from dictionary entries."""
+        dictionary = load_dictionary(self.dictionary_file)
+        if not dictionary:
+            QMessageBox.warning(self, "No dictionary", "Dictionary is empty. Import/save entries first.")
+            return
+        feature_type = self.hmm_p_feature_combo.currentText()
+        model_type = self.hmm_p_type_combo.currentText()
+        bundle = train_persisted_hmm_models(
+            dictionary=dictionary,
+            feature_type=feature_type,
+            model_type=model_type,
+            n_states=int(self.hmm_p_states_spin.value()),
+            codebook_size=int(self.hmm_p_codebook_spin.value()),
+            n_iters=int(self.hmm_p_iters_spin.value()),
+        )
+        if not bundle.get("models"):
+            QMessageBox.warning(self, "Training failed", "No valid sequences found to train persisted HMM.")
+            return
+        self.hmm_persist_bundle = bundle
+        self.hmm_p_status_label.setText(
+            f"Persisted HMM trained: labels={len(bundle['models'])}, type={model_type}, feature={feature_type}."
+        )
+
+    def hmm_p_save_bundle(self):
+        """Save persisted HMM bundle."""
+        if self.hmm_persist_bundle is None:
+            QMessageBox.warning(self, "No bundle", "Train or load persisted HMM bundle first.")
+            return
+        path = self._hmm_bundle_path()
+        save_hmm_bundle(self.hmm_persist_bundle, path)
+        self.hmm_p_status_label.setText(f"Persisted HMM bundle saved: {path}")
+
+    def hmm_p_load_bundle(self):
+        """Load persisted HMM bundle."""
+        path = self._hmm_bundle_path()
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "Missing bundle", f"HMM bundle file not found:\n{path}")
+            return
+        bundle = load_hmm_bundle(path)
+        self.hmm_persist_bundle = bundle
+        self.hmm_p_feature_combo.setCurrentText(bundle.get("feature_type", "mfcc"))
+        self.hmm_p_type_combo.setCurrentText(bundle.get("model_type", "discrete"))
+        self.hmm_p_status_label.setText(
+            f"Loaded persisted HMM bundle: labels={len(bundle.get('models', {}))}, type={bundle.get('model_type')}."
+        )
+
+    def hmm_p_classify_segment(self):
+        """Classify selected segment with persisted HMM models."""
+        if self.hmm_persist_bundle is None:
+            QMessageBox.warning(self, "No bundle", "Train or load persisted HMM bundle first.")
+            return
+        if self.audio_data.size == 0 or not self.segments:
+            QMessageBox.warning(self, "No segment", "Record and segment audio first.")
+            return
+        seg_idx = self._select_segment_index("classify with persisted HMM")
+        if seg_idx < 0:
+            return
+        start, end = self.segments[seg_idx]
+        params = self._current_params()
+        feature_type = self.hmm_persist_bundle.get("feature_type", "mfcc")
+        feats = self._extract_features_by_type(self.audio_data[start:end], feature_type, params)
+        if feats.size == 0:
+            QMessageBox.warning(self, "No features", "Feature extraction failed for selected segment.")
+            return
+        label, score, ranking = query_persisted_hmm(self.hmm_persist_bundle, feats)
+        if label is None:
+            QMessageBox.information(self, "No match", "No persisted HMM match found.")
+            return
+        top_lines = [f"{i+1}. {lab}: {sc:.3f}" for i, (lab, sc) in enumerate(ranking[:5])]
+        self.hmm_p_status_label.setText(
+            f"Persisted HMM prediction: {label} (score={score:.3f})."
+        )
+        QMessageBox.information(
+            self,
+            "Persisted HMM Recognition",
+            f"Best: {label} (score={score:.3f})\n\nTop scores:\n" + "\n".join(top_lines),
+        )
 
     def _select_audio_for_view(self) -> np.ndarray:
         """Select whole recording or one detected segment for visualization."""

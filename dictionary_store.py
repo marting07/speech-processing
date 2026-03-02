@@ -27,9 +27,21 @@ def load_dictionary(path: str) -> List[Dict[str, Any]]:
     """Load dictionary entries from JSON file. Returns [] if missing/invalid."""
     try:
         with open(path, "r", encoding="utf-8") as file:
-            data = json.load(file)
-            return data if isinstance(data, list) else []
-    except (FileNotFoundError, json.JSONDecodeError):
+            text = file.read()
+            try:
+                data = json.loads(text)
+                return data if isinstance(data, list) else []
+            except json.JSONDecodeError:
+                # Recovery path for partially-written JSON arrays: trim to last closing bracket.
+                end_idx = text.rfind("]")
+                if end_idx >= 0:
+                    try:
+                        data = json.loads(text[: end_idx + 1])
+                        return data if isinstance(data, list) else []
+                    except json.JSONDecodeError:
+                        return []
+                return []
+    except FileNotFoundError:
         return []
 
 
